@@ -1,0 +1,69 @@
+name: ci-integration
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  release:
+    types:
+      - prereleased
+  workflow_dispatch:
+
+jobs:
+  docker-integration:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gravitic-celestial
+    env:
+      DATABASE_URL: postgresql://gravity:gravity@localhost:5432/gravity
+      REDIS_URL: redis://localhost:6379
+      GRAVITY_API_URL: http://localhost:8000
+      SEC_IDENTITY: CI ci@example.com
+      GEMINI_API_KEY: ""
+      FIRECRAWL_API_KEY: ""
+      INTEGRATION_TICKERS: MSFT
+      INTEGRATION_POLL_TIMEOUT_SECONDS: "90"
+      INTEGRATION_POLL_INTERVAL_SECONDS: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+          cache-dependency-path: |
+            gravitic-celestial/requirements-docker.txt
+
+      - name: Install integration dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-docker.txt
+
+      - name: Build and start docker stack
+        run: docker compose -f docker/docker-compose.yml up -d --build postgres redis gravity-api gravity-workers
+
+      - name: Wait for API health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS "$GRAVITY_API_URL/health" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API failed health check"
+          docker compose -f docker/docker-compose.yml logs --tail=200
+          exit 1
+
+      - name: Run full integration suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f docker/docker-compose.yml logs --tail=300
+
+      - name: Shutdown stack
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v
+
