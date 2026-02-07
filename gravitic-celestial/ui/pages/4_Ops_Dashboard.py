@@ -8,7 +8,7 @@ inject_css()
 
 use_api, client, runtime, org_id, user_id = setup_auth_sidebar()
 
-# Ops dashboard does not require user auth context — it's system-wide
+# Ops dashboard shows system-wide data but still requires authenticated headers.
 
 # ---------------------------------------------------------------------------
 # Header
