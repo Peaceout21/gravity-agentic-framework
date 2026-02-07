@@ -31,6 +31,9 @@ jobs:
           pip install -r requirements.txt
           pip install "fastapi>=0.111.0" "uvicorn[standard]>=0.29.0" httpx
 
+      - name: Create data directory
+        run: mkdir -p data
+
       - name: Run fast test suite
         run: python -m unittest discover -s tests -v
 
