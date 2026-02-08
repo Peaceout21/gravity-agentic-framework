@@ -97,6 +97,43 @@ class GravityApiClient(object):
         resp.raise_for_status()
         return resp.json()
 
+    def list_ask_templates(self):
+        # type: () -> List[Dict[str, Any]]
+        resp = self._session.get(
+            "%s/ask/templates" % self.base_url,
+            headers=self._auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def run_ask_template(self, template_id, ticker=None, params=None):
+        # type: (int, Optional[str], Optional[Dict[str, Any]]) -> Dict[str, Any]
+        body = {"template_id": int(template_id)}
+        if ticker:
+            body["ticker"] = ticker.upper()
+        if params:
+            body["params"] = params
+        resp = self._session.post(
+            "%s/ask/template-run" % self.base_url,
+            json=body,
+            headers=self._auth_headers(),
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_template_runs(self, limit=20):
+        # type: (int) -> List[Dict[str, Any]]
+        resp = self._session.get(
+            "%s/ask/template-runs" % self.base_url,
+            params={"limit": limit},
+            headers=self._auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ------------------------------------------------------------------
     # Watchlist
     # ------------------------------------------------------------------
@@ -190,6 +227,28 @@ class GravityApiClient(object):
         )
         resp.raise_for_status()
         return resp.json().get("unread", 0)
+
+    def backfill_filing_metadata(self):
+        # type: () -> Dict[str, Any]
+        resp = self._session.post(
+            "%s/filings/backfill-metadata" % self.base_url,
+            json={},
+            headers=self._auth_headers(),
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def count_filings_for_ticker(self, ticker):
+        # type: (str) -> int
+        resp = self._session.get(
+            "%s/filings/ticker-count" % self.base_url,
+            params={"ticker": ticker.strip().upper()},
+            headers=self._auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("count", 0)
 
     # ------------------------------------------------------------------
     # Ops

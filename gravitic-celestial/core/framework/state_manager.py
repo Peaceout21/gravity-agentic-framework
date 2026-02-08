@@ -1,5 +1,6 @@
 """SQLite-backed ingestion and processing state."""
 
+import json
 import sqlite3
 import threading
 from datetime import datetime
@@ -24,6 +25,9 @@ class StateManager(object):
                     ticker TEXT NOT NULL,
                     filing_url TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    filing_type TEXT,
+                    item_code TEXT,
+                    filing_date TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -67,8 +71,64 @@ class StateManager(object):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ask_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_id TEXT,
+                    template_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    question_template TEXT NOT NULL,
+                    requires_ticker INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(org_id, template_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ask_template_filing_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    template_id INTEGER NOT NULL,
+                    filing_type TEXT NOT NULL,
+                    item_code TEXT NOT NULL DEFAULT '',
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(template_id, filing_type, item_code),
+                    FOREIGN KEY(template_id) REFERENCES ask_templates(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ask_template_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    template_id INTEGER NOT NULL,
+                    ticker TEXT,
+                    rendered_question TEXT NOT NULL,
+                    relevance_label TEXT NOT NULL,
+                    coverage_brief TEXT NOT NULL,
+                    answer_markdown TEXT NOT NULL,
+                    citations_json TEXT NOT NULL,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(template_id) REFERENCES ask_templates(id) ON DELETE CASCADE
+                )
+                """
+            )
             self._ensure_column(conn, "watchlists", "org_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(conn, "notifications", "org_id", "TEXT NOT NULL DEFAULT 'default'")
+            self._ensure_column(conn, "filings", "filing_type", "TEXT")
+            self._ensure_column(conn, "filings", "item_code", "TEXT")
+            self._ensure_column(conn, "filings", "filing_date", "TEXT")
+            self._seed_default_ask_templates(conn)
             conn.commit()
 
     @staticmethod
@@ -86,23 +146,58 @@ class StateManager(object):
             )
             return cur.fetchone() is not None
 
-    def upsert_filing(self, accession_number, ticker, filing_url, status):
+    def upsert_filing(
+        self,
+        accession_number,
+        ticker,
+        filing_url,
+        status,
+        filing_type=None,
+        item_code=None,
+        filing_date=None,
+    ):
         now = datetime.utcnow().isoformat()
         with self._lock:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO filings (accession_number, ticker, filing_url, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO filings (
+                        accession_number, ticker, filing_url, status,
+                        filing_type, item_code, filing_date, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(accession_number)
-                    DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at
+                    DO UPDATE SET
+                        status=excluded.status,
+                        filing_type=COALESCE(excluded.filing_type, filings.filing_type),
+                        item_code=COALESCE(excluded.item_code, filings.item_code),
+                        filing_date=COALESCE(excluded.filing_date, filings.filing_date),
+                        updated_at=excluded.updated_at
                     """,
-                    (accession_number, ticker, filing_url, status, now, now),
+                    (
+                        accession_number,
+                        ticker,
+                        filing_url,
+                        status,
+                        filing_type,
+                        item_code,
+                        filing_date,
+                        now,
+                        now,
+                    ),
                 )
                 conn.commit()
 
-    def mark_ingested(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "INGESTED")
+    def mark_ingested(self, accession_number, ticker, filing_url, filing_type=None, item_code=None, filing_date=None):
+        self.upsert_filing(
+            accession_number,
+            ticker,
+            filing_url,
+            "INGESTED",
+            filing_type=filing_type,
+            item_code=item_code,
+            filing_date=filing_date,
+        )
 
     def mark_analyzed(self, accession_number, ticker, filing_url):
         self.upsert_filing(accession_number, ticker, filing_url, "ANALYZED")
@@ -126,7 +221,7 @@ class StateManager(object):
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT accession_number, ticker, filing_url, status, updated_at
+                SELECT accession_number, ticker, filing_url, status, filing_type, item_code, filing_date, updated_at
                 FROM filings
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -140,7 +235,10 @@ class StateManager(object):
                 "ticker": row[1],
                 "filing_url": row[2],
                 "status": row[3],
-                "updated_at": row[4],
+                "filing_type": row[4] or "",
+                "item_code": row[5] or "",
+                "filing_date": row[6] or "",
+                "updated_at": row[7],
             }
             for row in rows
         ]
@@ -321,3 +419,314 @@ class StateManager(object):
             }
             for row in rows
         ]
+
+    def list_recent_analyzed_filings(self, ticker=None, limit=8):
+        # type: (Optional[str], int) -> List[Dict[str, Any]]
+        query = """
+            SELECT accession_number, ticker, filing_url, status, filing_type, item_code, filing_date, updated_at
+            FROM filings
+            WHERE status = 'ANALYZED'
+        """
+        params = []  # type: List[Any]
+        if ticker:
+            query += " AND ticker = ?"
+            params.append(ticker.upper())
+        query += " ORDER BY COALESCE(filing_date, updated_at) DESC, updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            cur = conn.execute(query, tuple(params))
+            rows = cur.fetchall()
+        return [
+            {
+                "accession_number": row[0],
+                "ticker": row[1],
+                "filing_url": row[2],
+                "status": row[3],
+                "filing_type": row[4] or "",
+                "item_code": row[5] or "",
+                "filing_date": row[6] or "",
+                "updated_at": row[7],
+            }
+            for row in rows
+        ]
+
+    def list_ask_templates(self, org_id, user_id=None):
+        # type: (str, Optional[str]) -> List[Dict[str, Any]]
+        _ = user_id
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, org_id, template_key, title, description, category, question_template,
+                       requires_ticker, enabled, sort_order
+                FROM ask_templates
+                WHERE enabled = 1 AND (org_id = ? OR org_id IS NULL)
+                ORDER BY CASE WHEN org_id = ? THEN 0 ELSE 1 END, sort_order ASC, title ASC
+                """,
+                (org_id, org_id),
+            )
+            rows = cur.fetchall()
+        seen_keys = set()
+        templates = []
+        for row in rows:
+            key = row[2]
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            templates.append(
+                {
+                    "id": row[0],
+                    "org_id": row[1],
+                    "template_key": key,
+                    "title": row[3],
+                    "description": row[4],
+                    "category": row[5],
+                    "question_template": row[6],
+                    "requires_ticker": bool(row[7]),
+                    "enabled": bool(row[8]),
+                    "sort_order": row[9],
+                }
+            )
+        return templates
+
+    def get_ask_template(self, org_id, template_id):
+        # type: (str, int) -> Optional[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, org_id, template_key, title, description, category, question_template,
+                       requires_ticker, enabled, sort_order
+                FROM ask_templates
+                WHERE id = ? AND enabled = 1 AND (org_id = ? OR org_id IS NULL)
+                LIMIT 1
+                """,
+                (template_id, org_id),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "org_id": row[1],
+            "template_key": row[2],
+            "title": row[3],
+            "description": row[4],
+            "category": row[5],
+            "question_template": row[6],
+            "requires_ticker": bool(row[7]),
+            "enabled": bool(row[8]),
+            "sort_order": row[9],
+        }
+
+    def list_ask_template_rules(self, template_id):
+        # type: (int) -> List[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT filing_type, item_code, weight
+                FROM ask_template_filing_rules
+                WHERE template_id = ?
+                ORDER BY weight DESC, filing_type ASC
+                """,
+                (template_id,),
+            )
+            rows = cur.fetchall()
+        return [{"filing_type": row[0], "item_code": row[1] or "", "weight": float(row[2])} for row in rows]
+
+    def create_ask_template_run(
+        self,
+        org_id,
+        user_id,
+        template_id,
+        ticker,
+        rendered_question,
+        relevance_label,
+        coverage_brief,
+        answer_markdown,
+        citations,
+        latency_ms=0,
+    ):
+        # type: (...) -> int
+        now = datetime.utcnow().isoformat()
+        citations_json = json.dumps(citations or [], ensure_ascii=True)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ask_template_runs(
+                    org_id, user_id, template_id, ticker, rendered_question, relevance_label,
+                    coverage_brief, answer_markdown, citations_json, latency_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    org_id,
+                    user_id,
+                    template_id,
+                    ticker.upper() if ticker else None,
+                    rendered_question,
+                    relevance_label,
+                    coverage_brief,
+                    answer_markdown,
+                    citations_json,
+                    int(latency_ms),
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def list_ask_template_runs(self, org_id, user_id, limit=20):
+        # type: (str, str, int) -> List[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT r.id, r.template_id, t.title, r.ticker, r.rendered_question, r.relevance_label,
+                       r.coverage_brief, r.answer_markdown, r.citations_json, r.latency_ms, r.created_at
+                FROM ask_template_runs r
+                JOIN ask_templates t ON t.id = r.template_id
+                WHERE r.org_id = ? AND r.user_id = ?
+                ORDER BY r.created_at DESC
+                LIMIT ?
+                """,
+                (org_id, user_id, limit),
+            )
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            try:
+                citations = json.loads(row[8] or "[]")
+            except Exception:
+                citations = []
+            results.append(
+                {
+                    "id": row[0],
+                    "template_id": row[1],
+                    "template_title": row[2],
+                    "ticker": row[3] or "",
+                    "rendered_question": row[4],
+                    "relevance_label": row[5],
+                    "coverage_brief": row[6],
+                    "answer_markdown": row[7],
+                    "citations": citations,
+                    "latency_ms": row[9],
+                    "created_at": row[10],
+                }
+            )
+        return results
+
+    def count_filings_for_ticker(self, ticker):
+        # type: (str) -> int
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM filings WHERE ticker = ?",
+                (ticker.upper(),),
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+    def backfill_filing_metadata(self):
+        # type: () -> int
+        """Populate filing_type for rows where it is NULL/empty by parsing the filing_url.
+
+        SEC EDGAR filing URLs contain the form type slug, e.g. ``/10-Q/``, ``/10-K/``, ``/8-K/``.
+        This is a best-effort heuristic; rows that cannot be inferred are left unchanged.
+        Returns the number of rows updated.
+        """
+        import re
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT accession_number, filing_url FROM filings WHERE filing_type IS NULL OR filing_type = ''"
+            )
+            rows = cur.fetchall()
+        updated = 0
+        type_pattern = re.compile(r"/(10-[QK]|8-K|6-K|20-F|S-1|DEF 14A|SC 13D)[/\b]", re.IGNORECASE)
+        for accession, url in rows:
+            match = type_pattern.search(url or "")
+            if not match:
+                continue
+            filing_type = match.group(1).upper()
+            with self._lock:
+                with self._connect() as conn:
+                    conn.execute(
+                        "UPDATE filings SET filing_type = ? WHERE accession_number = ? AND (filing_type IS NULL OR filing_type = '')",
+                        (filing_type, accession),
+                    )
+                    conn.commit()
+            updated += 1
+        return updated
+
+    def _seed_default_ask_templates(self, conn):
+        now = datetime.utcnow().isoformat()
+        defaults = [
+            {
+                "key": "qoq_changes",
+                "title": "Quarter-over-quarter changes",
+                "description": "Summarize what changed versus the previous quarter.",
+                "category": "overview",
+                "question_template": "What changed versus the previous quarter for {ticker}?",
+                "requires_ticker": 1,
+                "sort_order": 10,
+                "rules": [("10-Q", None, 1.0), ("10-K", None, 0.9), ("8-K", "2.02", 0.6)],
+            },
+            {
+                "key": "kpi_surprises",
+                "title": "Top KPI surprises",
+                "description": "Highlight top KPI surprises from the latest filing.",
+                "category": "kpi",
+                "question_template": "What are the top KPI surprises in the latest filing for {ticker}?",
+                "requires_ticker": 1,
+                "sort_order": 20,
+                "rules": [("10-Q", None, 1.0), ("10-K", None, 0.9), ("8-K", "2.02", 0.7)],
+            },
+            {
+                "key": "guidance_shift",
+                "title": "Guidance shifts",
+                "description": "Find changes in management guidance and implications.",
+                "category": "guidance",
+                "question_template": "What guidance changes were disclosed for {ticker}, and what do they imply?",
+                "requires_ticker": 1,
+                "sort_order": 30,
+                "rules": [("10-Q", None, 0.9), ("10-K", None, 0.8), ("8-K", "2.02", 1.0)],
+            },
+            {
+                "key": "risk_flags",
+                "title": "Key risk flags",
+                "description": "Surface notable risks from latest disclosures.",
+                "category": "risk",
+                "question_template": "What key risks were flagged in the latest filing for {ticker}?",
+                "requires_ticker": 1,
+                "sort_order": 40,
+                "rules": [("10-K", None, 1.0), ("10-Q", None, 0.8), ("8-K", None, 0.4)],
+            },
+        ]
+        for template in defaults:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO ask_templates(
+                    org_id, template_key, title, description, category, question_template,
+                    requires_ticker, enabled, sort_order, created_at, updated_at
+                ) VALUES (NULL, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    template["key"],
+                    template["title"],
+                    template["description"],
+                    template["category"],
+                    template["question_template"],
+                    template["requires_ticker"],
+                    template["sort_order"],
+                    now,
+                    now,
+                ),
+            )
+            cur = conn.execute("SELECT id FROM ask_templates WHERE org_id IS NULL AND template_key = ?", (template["key"],))
+            row = cur.fetchone()
+            if not row:
+                continue
+            template_id = int(row[0])
+            for filing_type, item_code, weight in template["rules"]:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO ask_template_filing_rules(template_id, filing_type, item_code, weight, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (template_id, filing_type, item_code or "", weight, now),
+                )

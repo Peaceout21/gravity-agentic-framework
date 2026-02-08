@@ -162,6 +162,59 @@ class BackfillResponse(BaseModel):
     indexed: Optional[int] = None
 
 
+class BackfillMetadataResponse(BaseModel):
+    updated: int
+
+
+class TickerCountResponse(BaseModel):
+    ticker: str
+    count: int
+
+
+class AskTemplateItem(BaseModel):
+    id: int
+    template_key: str
+    title: str
+    description: str
+    category: str
+    question_template: str
+    requires_ticker: bool
+    sort_order: int
+
+
+class TemplateRunRequest(BaseModel):
+    template_id: int
+    ticker: Optional[str] = None
+    params: Optional[dict] = None
+
+
+class TemplateRunResponse(BaseModel):
+    run_id: int
+    template_id: int
+    template_title: str
+    rendered_question: str
+    relevance_label: str
+    relevance_score: float
+    coverage_brief: str
+    answer_markdown: str
+    citations: List[str]
+    latency_ms: int
+
+
+class TemplateRunItem(BaseModel):
+    id: int
+    template_id: int
+    template_title: str
+    ticker: str
+    rendered_question: str
+    relevance_label: str
+    coverage_brief: str
+    answer_markdown: str
+    citations: List[str]
+    latency_ms: int
+    created_at: str
+
+
 class AuthContext(BaseModel):
     org_id: str
     user_id: str
@@ -275,6 +328,67 @@ def query(req: QueryRequest):
         answer_markdown=answer.answer_markdown,
         citations=answer.citations,
     )
+
+
+@app.get("/ask/templates", response_model=List[AskTemplateItem])
+def list_ask_templates(auth: AuthContext = Depends(_auth_context)):
+    comps = _get_components()
+    rows = comps["state_manager"].list_ask_templates(org_id=auth.org_id, user_id=auth.user_id)
+    return [
+        AskTemplateItem(
+            id=row["id"],
+            template_key=row["template_key"],
+            title=row["title"],
+            description=row["description"],
+            category=row["category"],
+            question_template=row.get("question_template", ""),
+            requires_ticker=bool(row["requires_ticker"]),
+            sort_order=int(row.get("sort_order", 0)),
+        )
+        for row in rows
+    ]
+
+
+@app.post("/ask/template-run", response_model=TemplateRunResponse)
+def run_ask_template(req: TemplateRunRequest, auth: AuthContext = Depends(_auth_context)):
+    comps = _get_components()
+    template = comps["state_manager"].get_ask_template(org_id=auth.org_id, template_id=req.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+
+    ticker = (req.ticker or "").strip().upper()
+    if template.get("requires_ticker") and not ticker:
+        raise HTTPException(status_code=400, detail="Ticker is required for this template")
+
+    from services.ask_templates import run_template_query
+
+    try:
+        result = run_template_query(
+            state_manager=comps["state_manager"],
+            graph_runtime=comps["graph_runtime"],
+            org_id=auth.org_id,
+            user_id=auth.user_id,
+            template=template,
+            ticker=ticker or None,
+            params=req.params or {},
+        )
+    except Exception as exc:
+        if hasattr(comps["state_manager"], "log_event"):
+            comps["state_manager"].log_event(
+                "TEMPLATE_RUN_FAILED",
+                "api",
+                '{"template_id": %d, "error": "%s"}' % (req.template_id, str(exc).replace('"', "'")),
+            )
+        raise HTTPException(status_code=500, detail="Template run failed: %s" % exc)
+
+    return TemplateRunResponse(**result)
+
+
+@app.get("/ask/template-runs", response_model=List[TemplateRunItem])
+def list_template_runs(limit: int = 20, auth: AuthContext = Depends(_auth_context)):
+    comps = _get_components()
+    rows = comps["state_manager"].list_ask_template_runs(org_id=auth.org_id, user_id=auth.user_id, limit=limit)
+    return [TemplateRunItem(**row) for row in rows]
 
 
 @app.get("/watchlist", response_model=List[WatchlistItem])
@@ -401,3 +515,22 @@ def ops_metrics(window_minutes: int = 60, auth: AuthContext = Depends(_auth_cont
         failed_jobs=failed_jobs,
         recent_failures=sm.list_recent_failures(limit=20),
     )
+
+
+@app.post("/filings/backfill-metadata", response_model=BackfillMetadataResponse)
+def backfill_filing_metadata(auth: AuthContext = Depends(_auth_context)):
+    _ = auth
+    comps = _get_components()
+    updated = comps["state_manager"].backfill_filing_metadata()
+    return BackfillMetadataResponse(updated=updated)
+
+
+@app.get("/filings/ticker-count", response_model=TickerCountResponse)
+def ticker_filing_count(ticker: str, auth: AuthContext = Depends(_auth_context)):
+    _ = auth
+    comps = _get_components()
+    t = ticker.strip().upper()
+    if not t:
+        raise HTTPException(status_code=400, detail="Ticker is required")
+    count = comps["state_manager"].count_filings_for_ticker(t)
+    return TickerCountResponse(ticker=t, count=count)

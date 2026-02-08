@@ -188,6 +188,28 @@ else:
     st.success("No recent failures. Pipeline is healthy.")
 
 # ---------------------------------------------------------------------------
+# Maintenance Actions
+# ---------------------------------------------------------------------------
+st.markdown("### Maintenance")
+
+if st.button("Backfill filing metadata", help="Populate filing_type for old filings that are missing it (inferred from URL). Safe to run multiple times."):
+    with st.spinner("Backfilling metadata..."):
+        try:
+            if use_api:
+                result = client.backfill_filing_metadata()
+                updated = result.get("updated", 0)
+            else:
+                updated = runtime.state_manager.backfill_filing_metadata()
+            if updated > 0:
+                st.success("Updated filing_type on %d filings." % updated)
+            else:
+                st.info("No filings needed metadata backfill.")
+        except Exception as exc:
+            st.error("Backfill failed: %s" % exc)
+
+st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
 # Auto-refresh
 # ---------------------------------------------------------------------------
 st.divider()

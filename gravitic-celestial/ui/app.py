@@ -124,6 +124,70 @@ with left:
 # -- Quick Q&A -------------------------------------------------------------
 with right:
     st.markdown("### Quick Ask")
+    try:
+        if use_api:
+            _dash_templates = client.list_ask_templates()
+        else:
+            _dash_templates = sm.list_ask_templates(org_id, user_id)
+    except Exception:
+        _dash_templates = []
+    if _dash_templates:
+        template_options = {item["title"]: item for item in _dash_templates}
+        selected_template_title = st.selectbox(
+            "Template prompt",
+            options=list(template_options.keys()),
+            key="dash_template_select",
+        )
+        selected_template = template_options[selected_template_title]
+        template_ticker = st.text_input(
+            "Template ticker",
+            value="",
+            placeholder="e.g. MSFT",
+            key="dash_template_ticker",
+        )
+        _dash_period_options = ["Latest quarter", "Last two quarters", "Latest annual", "Trailing twelve months"]
+        dash_period = st.selectbox("Period", _dash_period_options, index=0, key="dash_template_period")
+        # Ticker validation
+        if template_ticker and template_ticker.strip():
+            try:
+                if use_api:
+                    _tc = client.count_filings_for_ticker(template_ticker.strip())
+                else:
+                    _tc = sm.count_filings_for_ticker(template_ticker.strip())
+                if _tc == 0:
+                    st.warning("No filings found for %s. Check spelling or ingest filings first." % template_ticker.strip().upper())
+            except Exception:
+                pass
+        if st.button("Run template", key="dash_run_template", use_container_width=True):
+            with st.spinner("Running template..."):
+                try:
+                    _params = {}
+                    if dash_period and dash_period != "Latest quarter":
+                        _params["period"] = dash_period.lower()
+                    if use_api:
+                        result = client.run_ask_template(
+                            template_id=selected_template["id"],
+                            ticker=template_ticker.strip() or None,
+                            params=_params or None,
+                        )
+                    else:
+                        from services.ask_templates import run_template_query
+                        result = run_template_query(
+                            state_manager=sm,
+                            graph_runtime=runtime.graph_runtime,
+                            org_id=org_id,
+                            user_id=user_id,
+                            template=selected_template,
+                            ticker=template_ticker.strip().upper() or None,
+                            params=_params or None,
+                        )
+                    st.caption("%s | %s" % (result.get("relevance_label", ""), result.get("coverage_brief", "")))
+                    st.markdown(result.get("answer_markdown", "No answer generated."))
+                    if result.get("citations"):
+                        st.caption("Sources: %s" % ", ".join(result["citations"]))
+                except Exception as exc:
+                    st.error("Template run failed: %s" % exc)
+        st.markdown("---")
     question = st.text_area(
         "Ask about filings",
         height=120,
@@ -132,6 +196,16 @@ with right:
         label_visibility="collapsed",
     )
     ticker_filter = st.text_input("Ticker context (optional)", value="", key="dash_ticker", placeholder="e.g. MSFT")
+    if ticker_filter and ticker_filter.strip():
+        try:
+            if use_api:
+                _ffc = client.count_filings_for_ticker(ticker_filter.strip())
+            else:
+                _ffc = sm.count_filings_for_ticker(ticker_filter.strip())
+            if _ffc == 0:
+                st.warning("No filings found for %s." % ticker_filter.strip().upper())
+        except Exception:
+            pass
 
     if st.button("Ask", key="dash_ask", type="primary", use_container_width=True):
         if not question.strip():
