@@ -74,6 +74,16 @@ class GeminiAdapter(object):
 
 class ExtractionEngine(object):
     REQUIRED_KPI_KEYS = ["metric", "value"]
+    REVENUE_ALIASES = [
+        "revenue",
+        "net sales",
+        "sales",
+        "turnover",
+        "top line",
+        "total revenue",
+        "product revenue",
+        "services revenue",
+    ]
 
     def __init__(self, adapter=None):
         self.adapter = adapter or GeminiAdapter()
@@ -83,7 +93,7 @@ class ExtractionEngine(object):
         data = self.adapter.generate_json(prompt)
         if not isinstance(data, dict):
             return {}
-        return data
+        return self._normalize_metric_aliases(data)
 
     def extract_with_reflection(self, raw_text):
         primary = self.extract(raw_text, reflection=False)
@@ -103,29 +113,81 @@ class ExtractionEngine(object):
             for key in self.REQUIRED_KPI_KEYS:
                 if key not in item:
                     return False
-        contains_revenue = any("revenue" in item.get("metric", "").lower() for item in kpis)
-        return contains_revenue
+        if self._contains_revenue_metric(kpis):
+            return True
+        # Agentic fallback: if extraction used alternate wording, ask model to classify
+        # whether one KPI is revenue-equivalent (e.g., net sales, turnover).
+        return self._llm_deduces_revenue(data)
+
+    def _contains_revenue_metric(self, kpis):
+        # type: (List[Dict[str, Any]]) -> bool
+        for item in kpis:
+            metric = str(item.get("metric", "")).lower()
+            for alias in self.REVENUE_ALIASES:
+                if alias in metric:
+                    return True
+        return False
+
+    def _normalize_metric_aliases(self, data):
+        # type: (Dict[str, Any]) -> Dict[str, Any]
+        kpis = data.get("kpis")
+        if not isinstance(kpis, list):
+            return data
+        for item in kpis:
+            if not isinstance(item, dict):
+                continue
+            metric = str(item.get("metric", ""))
+            lower = metric.lower()
+            for alias in self.REVENUE_ALIASES:
+                if alias in lower:
+                    if metric != "Revenue":
+                        item.setdefault("raw_metric", metric)
+                        item["metric"] = "Revenue"
+                    break
+        return data
+
+    def _llm_deduces_revenue(self, data):
+        # type: (Dict[str, Any]) -> bool
+        generator = getattr(self.adapter, "generate_text", None)
+        if generator is None:
+            return False
+        try:
+            probe = {
+                "kpis": data.get("kpis", []),
+                "summary": data.get("summary", {}),
+                "guidance": data.get("guidance", []),
+            }
+            prompt = (
+                "Determine if any KPI is revenue-equivalent (revenue, net sales, turnover, top line). "
+                "Answer with YES or NO only.\n\nData:\n%s" % json.dumps(probe, ensure_ascii=True)
+            )
+            decision = (generator(prompt) or "").strip().upper()
+            return decision.startswith("YES")
+        except Exception:
+            logging.exception("Revenue-equivalent KPI inference failed")
+            return False
 
     @staticmethod
     def _build_prompt(raw_text, reflection=False):
         if PromptTemplate is not None:
             template = (
                 "Extract financial data as JSON with keys: kpis, summary, guidance. "
-                "Previous extraction failed. Ensure Revenue is present when available.\n\nText:\n{text}"
+                "Previous extraction failed. Ensure Revenue (or equivalent such as net sales/turnover) is present when available.\n\nText:\n{text}"
                 if reflection
                 else "You are a CFA-level financial analyst. Return valid JSON only with keys: kpis, summary, guidance. "
-                "Each KPI requires metric and value.\n\nText:\n{text}"
+                "Each KPI requires metric and value. Normalize revenue-equivalent metrics (e.g., net sales) to metric='Revenue'.\n\nText:\n{text}"
             )
             return PromptTemplate.from_template(template).format(text=raw_text)
         if reflection:
             return (
                 "Extract financial data as JSON with keys: kpis, summary, guidance. "
-                "Previous extraction failed. Ensure Revenue is present when available.\n\n"
+                "Previous extraction failed. Ensure Revenue (or equivalent such as net sales/turnover) is present when available.\n\n"
                 "Text:\n%s" % raw_text
             )
         return (
             "You are a CFA-level financial analyst. Return valid JSON only with keys: kpis, summary, guidance. "
-            "Each KPI requires metric and value.\n\nText:\n%s" % raw_text
+            "Each KPI requires metric and value. Normalize revenue-equivalent metrics (e.g., net sales) to metric='Revenue'.\n\nText:\n%s"
+            % raw_text
         )
 
 

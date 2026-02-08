@@ -93,7 +93,23 @@ def normalize_analysis_dict(data):
         kpis = [kpis]
     elif not isinstance(kpis, list):
         kpis = []
-    kpis = [item for item in kpis if isinstance(item, dict)]
+    normalized_kpis = []
+    for item in kpis:
+        if not isinstance(item, dict):
+            continue
+        metric = item.get("metric")
+        value = item.get("value")
+        if metric is None or value is None:
+            continue
+        normalized = {"metric": str(metric), "value": str(value)}
+        for key, val in item.items():
+            if key in ("metric", "value"):
+                continue
+            if val is None:
+                continue
+            normalized[str(key)] = str(val)
+        normalized_kpis.append(normalized)
+    kpis = normalized_kpis
 
     summary = data.get("summary", {})
     if isinstance(summary, str):
@@ -102,6 +118,14 @@ def normalize_analysis_dict(data):
         summary = {"highlights": [str(item) for item in summary]}
     elif not isinstance(summary, dict):
         summary = {}
+    else:
+        coerced_summary = {}
+        for key, value in summary.items():
+            if isinstance(value, list):
+                coerced_summary[str(key)] = [str(item) for item in value]
+            else:
+                coerced_summary[str(key)] = [str(value)]
+        summary = coerced_summary
 
     guidance = data.get("guidance", [])
     if isinstance(guidance, dict):
@@ -110,6 +134,17 @@ def normalize_analysis_dict(data):
         guidance = [{"note": guidance}]
     elif not isinstance(guidance, list):
         guidance = []
-    guidance = [item for item in guidance if isinstance(item, dict)]
+    normalized_guidance = []
+    for item in guidance:
+        if not isinstance(item, dict):
+            continue
+        normalized_item = {}
+        for key, value in item.items():
+            if value is None:
+                continue
+            normalized_item[str(key)] = str(value)
+        if normalized_item:
+            normalized_guidance.append(normalized_item)
+    guidance = normalized_guidance
 
     return {"kpis": kpis, "summary": summary, "guidance": guidance}

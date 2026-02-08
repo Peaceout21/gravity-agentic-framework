@@ -48,6 +48,17 @@ class StateManagerTests(unittest.TestCase):
             unread = manager.list_notifications("o1", "u1", limit=10, unread_only=True)
             self.assertEqual(len(unread), 0)
 
+    def test_event_activity_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "state.db")
+            manager = StateManager(db_path=db_path)
+            manager.log_event("INGESTION_CYCLE", "test", "{}")
+            manager.log_event("INGESTION_CYCLE", "test", "{}")
+            manager.log_event("ANALYSIS_SUCCESS", "test", "{}")
+            counts = manager.count_recent_events(minutes=60)
+            self.assertEqual(counts.get("INGESTION_CYCLE"), 2)
+            self.assertEqual(counts.get("ANALYSIS_SUCCESS"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

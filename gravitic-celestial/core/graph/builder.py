@@ -1,5 +1,6 @@
 """LangGraph builder and runtime service interface."""
 
+import json
 from typing import List, Optional
 
 from core.framework.messages import MarkdownAnswer
@@ -45,6 +46,17 @@ class GraphRuntime(object):
         self.analysis_graph = self._build_analysis_graph()
         self.knowledge_graph = self._build_knowledge_graph()
         self.query_graph = self._build_query_graph()
+
+    def _safe_log_event(self, topic, source, payload=None):
+        # type: (str, str, Optional[dict]) -> None
+        if not hasattr(self.state_manager, "log_event"):
+            return
+        try:
+            payload_text = json.dumps(payload or {}, ensure_ascii=True)
+            self.state_manager.log_event(topic, source, payload_text)
+        except Exception:
+            # Logging should never break pipeline execution.
+            pass
 
     def _build_ingestion_graph(self):
         graph = StateGraph(dict)
@@ -139,17 +151,52 @@ class GraphRuntime(object):
         initial_state = {"trace": [], "errors": []}
         final_state = self.ingestion_graph.invoke(initial_state)
         self.checkpoint_store.save_state("ingestion", "default", final_state)
-        return list(final_state.get("filing_payloads", []))
+        payloads = list(final_state.get("filing_payloads", []))
+        self._safe_log_event(
+            "INGESTION_CYCLE",
+            "graph_runtime",
+            {"tickers": tickers, "filings_found": len(payloads), "errors": final_state.get("errors", [])},
+        )
+        return payloads
 
     def analyze_filing(self, payload):
         state = {"filing_payload": payload, "trace": [], "errors": []}
-        final_state = self.analysis_graph.invoke(state)
-        self.checkpoint_store.save_state("analysis", payload.accession_number, final_state)
+        try:
+            final_state = self.analysis_graph.invoke(state)
+            self.checkpoint_store.save_state("analysis", payload.accession_number, final_state)
+        except Exception as exc:
+            self.state_manager.mark_dead_letter(payload.accession_number, payload.ticker, payload.filing_url)
+            self._safe_log_event(
+                "ANALYSIS_DEAD_LETTER",
+                "graph_runtime",
+                {
+                    "ticker": payload.ticker,
+                    "accession_number": payload.accession_number,
+                    "errors": [str(exc)],
+                },
+            )
+            return None
+
         if final_state.get("analysis"):
             self.state_manager.mark_analyzed(payload.accession_number, payload.ticker, payload.filing_url)
-        else:
-            self.state_manager.mark_dead_letter(payload.accession_number, payload.ticker, payload.filing_url)
-        return final_state.get("analysis")
+            self._safe_log_event(
+                "ANALYSIS_SUCCESS",
+                "graph_runtime",
+                {"ticker": payload.ticker, "accession_number": payload.accession_number},
+            )
+            return final_state.get("analysis")
+
+        self.state_manager.mark_dead_letter(payload.accession_number, payload.ticker, payload.filing_url)
+        self._safe_log_event(
+            "ANALYSIS_DEAD_LETTER",
+            "graph_runtime",
+            {
+                "ticker": payload.ticker,
+                "accession_number": payload.accession_number,
+                "errors": final_state.get("errors", []),
+            },
+        )
+        return None
 
     def index_analysis(self, payload):
         state = {"analysis": payload, "trace": [], "errors": []}
@@ -157,9 +204,24 @@ class GraphRuntime(object):
             final_state = self.knowledge_graph.invoke(state)
             receipt = final_state.get("index_receipt")
             self.checkpoint_store.save_state("knowledge", payload.accession_number, final_state)
+            chunk_count = None
+            if hasattr(receipt, "chunk_count"):
+                chunk_count = receipt.chunk_count
+            elif isinstance(receipt, dict):
+                chunk_count = receipt.get("chunk_count")
+            self._safe_log_event(
+                "INDEX_SUCCESS",
+                "graph_runtime",
+                {"ticker": payload.ticker, "accession_number": payload.accession_number, "chunk_count": chunk_count},
+            )
             return receipt
-        except Exception:
+        except Exception as exc:
             self.state_manager.mark_analyzed_not_indexed(payload.accession_number, payload.ticker, "")
+            self._safe_log_event(
+                "INDEX_FAILURE",
+                "graph_runtime",
+                {"ticker": payload.ticker, "accession_number": payload.accession_number, "error": str(exc)},
+            )
             raise
 
     def answer_question(self, question, ticker=None):
@@ -171,6 +233,11 @@ class GraphRuntime(object):
         }
         final_state = self.query_graph.invoke(state)
         self.checkpoint_store.save_state("query", question, final_state)
+        self._safe_log_event(
+            "QUERY_ANSWERED",
+            "graph_runtime",
+            {"ticker": ticker, "citations": len(final_state.get("answer_citations", []))},
+        )
         return MarkdownAnswer(
             question=question,
             answer_markdown=final_state.get("answer", ""),

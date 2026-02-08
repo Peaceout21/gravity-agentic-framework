@@ -1,5 +1,7 @@
 """Backfill orchestration shared by API and worker."""
 
+import json
+
 from core.framework.messages import FilingPayload
 from services.notifications import create_filing_notifications
 
@@ -19,6 +21,18 @@ def run_backfill(graph_runtime, state_manager, request):
     include_existing = bool(request.get("include_existing", False))
     notify = bool(request.get("notify", False))
     org_id = request.get("org_id", "default")
+    if hasattr(state_manager, "log_event"):
+        try:
+            state_manager.log_event(
+                "BACKFILL_STARTED",
+                "backfill",
+                json.dumps(
+                    {"org_id": org_id, "tickers": tickers, "per_ticker_limit": per_ticker_limit},
+                    ensure_ascii=True,
+                ),
+            )
+        except Exception:
+            pass
 
     edgar_client = graph_runtime.ingestion_nodes.edgar_client
     records = edgar_client.get_recent_filings(tickers=tickers, per_ticker_limit=per_ticker_limit)
@@ -58,10 +72,16 @@ def run_backfill(graph_runtime, state_manager, request):
             if receipt:
                 indexed += 1
 
-    return {
+    result = {
         "tickers": tickers,
         "records_found": len(records),
         "filings_processed": len(payloads),
         "analyzed": analyzed,
         "indexed": indexed,
     }
+    if hasattr(state_manager, "log_event"):
+        try:
+            state_manager.log_event("BACKFILL_COMPLETED", "backfill", json.dumps(result, ensure_ascii=True))
+        except Exception:
+            pass
+    return result
