@@ -163,7 +163,10 @@ class BackfillResponse(BaseModel):
 
 
 class BackfillMetadataResponse(BaseModel):
-    updated: int
+    updated_count: int
+    skipped_count: int
+    total_scanned: int
+    samples: List[str]
 
 
 class TickerCountResponse(BaseModel):
@@ -521,8 +524,13 @@ def ops_metrics(window_minutes: int = 60, auth: AuthContext = Depends(_auth_cont
 def backfill_filing_metadata(auth: AuthContext = Depends(_auth_context)):
     _ = auth
     comps = _get_components()
-    updated = comps["state_manager"].backfill_filing_metadata()
-    return BackfillMetadataResponse(updated=updated)
+    result = comps["state_manager"].backfill_filing_metadata()
+    return BackfillMetadataResponse(
+        updated_count=result["updated_count"],
+        skipped_count=result["skipped_count"],
+        total_scanned=result["total_scanned"],
+        samples=result["samples"],
+    )
 
 
 @app.get("/filings/ticker-count", response_model=TickerCountResponse)

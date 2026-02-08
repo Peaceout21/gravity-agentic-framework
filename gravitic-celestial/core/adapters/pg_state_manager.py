@@ -611,37 +611,41 @@ class PostgresStateManager(object):
             self._put(conn)
 
     def backfill_filing_metadata(self):
-        # type: () -> int
-        """Populate filing_type for rows where it is NULL/empty by parsing the filing_url."""
-        import re
+        # type: () -> Dict[str, Any]
+        """Populate filing_type for rows where it is NULL/empty."""
+        from core.framework.state_manager import _backfill_filing_metadata_impl
+
+        return _backfill_filing_metadata_impl(
+            fetch_rows=lambda: self._fetch_empty_metadata_rows(),
+            update_row=lambda acc, ft: self._update_filing_type(acc, ft),
+        )
+
+    def _fetch_empty_metadata_rows(self):
+        # type: () -> list
         conn = self._conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT accession_number, filing_url FROM filings WHERE filing_type IS NULL OR filing_type = ''"
                 )
-                rows = cur.fetchall()
+                return cur.fetchall()
         finally:
             self._put(conn)
-        updated = 0
-        type_pattern = re.compile(r"/(10-[QK]|8-K|6-K|20-F|S-1|DEF 14A|SC 13D)[/\b]", re.IGNORECASE)
-        for accession, url in rows:
-            match = type_pattern.search(url or "")
-            if not match:
-                continue
-            filing_type = match.group(1).upper()
-            conn = self._conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE filings SET filing_type = %s WHERE accession_number = %s AND (filing_type IS NULL OR filing_type = '')",
-                        (filing_type, accession),
-                    )
-                conn.commit()
-            finally:
-                self._put(conn)
-            updated += 1
-        return updated
+
+    def _update_filing_type(self, accession, filing_type):
+        # type: (str, str) -> bool
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE filings SET filing_type = %s WHERE accession_number = %s AND (filing_type IS NULL OR filing_type = '')",
+                    (filing_type, accession),
+                )
+                ok = cur.rowcount > 0
+            conn.commit()
+            return ok
+        finally:
+            self._put(conn)
 
     def _seed_default_ask_templates(self):
         defaults = [

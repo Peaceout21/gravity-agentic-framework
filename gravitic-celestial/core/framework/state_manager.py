@@ -1,10 +1,92 @@
 """SQLite-backed ingestion and processing state."""
 
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Filing-type inference from EDGAR URLs
+# ---------------------------------------------------------------------------
+# Pass 1: canonical path segments — handles /10-Q/, /10-K/, /8-K/ etc.
+_CANONICAL_PATTERN = re.compile(
+    r"/(10-[QK](?:/A)?|8-K(?:/A)?|6-K|20-F|S-1|SD)[/\b]",
+    re.IGNORECASE,
+)
+
+# Pass 2: compact EDGAR tokens found in filenames / URL slugs.
+# Maps lowercase token → canonical form type.
+_COMPACT_TOKEN_MAP = {
+    "10q": "10-Q",
+    "10k": "10-K",
+    "10ka": "10-K/A",
+    "10qa": "10-Q/A",
+    "8k": "8-K",
+    "8ka": "8-K/A",
+    "6k": "6-K",
+    "20f": "20-F",
+    "s1": "S-1",
+    "def14a": "DEF 14A",
+    "defa14a": "DEFA14A",
+    "sc13d": "SC 13D",
+    "sc13g": "SC 13G",
+    "sd": "SD",
+}
+
+# Build a single pattern from the token map for fallback matching.
+_COMPACT_PATTERN = re.compile(
+    r"(?:^|[/\-_.])(%s)(?:[/\-_.]|$)" % "|".join(re.escape(k) for k in _COMPACT_TOKEN_MAP),
+    re.IGNORECASE,
+)
+
+
+def _infer_filing_type(url):
+    # type: (str) -> Optional[str]
+    """Try to extract the SEC form type from a URL using two heuristics."""
+    if not url:
+        return None
+    # Pass 1: canonical path segment
+    m = _CANONICAL_PATTERN.search(url)
+    if m:
+        return m.group(1).upper()
+    # Pass 2: compact token in filename / slug
+    m = _COMPACT_PATTERN.search(url)
+    if m:
+        token = m.group(1).lower()
+        return _COMPACT_TOKEN_MAP.get(token)
+    return None
+
+
+def _backfill_filing_metadata_impl(fetch_rows, update_row):
+    # type: (Any, Any) -> Dict[str, Any]
+    """Shared backfill logic used by both SQLite and Postgres state managers."""
+    rows = fetch_rows()
+    total = len(rows)
+    updated = 0
+    skipped = 0
+    samples = []  # type: List[str]
+
+    for accession, url in rows:
+        filing_type = _infer_filing_type(url)
+        if filing_type is None:
+            skipped += 1
+            continue
+        ok = update_row(accession, filing_type)
+        if ok:
+            updated += 1
+            if len(samples) < 5:
+                samples.append(accession)
+        else:
+            skipped += 1
+
+    return {
+        "updated_count": updated,
+        "skipped_count": skipped,
+        "total_scanned": total,
+        "samples": samples,
+    }
 
 
 class StateManager(object):
@@ -623,35 +705,40 @@ class StateManager(object):
             return row[0] if row else 0
 
     def backfill_filing_metadata(self):
-        # type: () -> int
-        """Populate filing_type for rows where it is NULL/empty by parsing the filing_url.
+        # type: () -> Dict[str, Any]
+        """Populate filing_type for rows where it is NULL/empty.
 
-        SEC EDGAR filing URLs contain the form type slug, e.g. ``/10-Q/``, ``/10-K/``, ``/8-K/``.
-        This is a best-effort heuristic; rows that cannot be inferred are left unchanged.
-        Returns the number of rows updated.
+        Uses two heuristics in order:
+        1. Canonical URL path segments (``/10-Q/``, ``/8-K/``, etc.)
+        2. Compact EDGAR tokens often found in filenames (``def14a``, ``sc13d``, ``20f``, etc.)
+
+        Returns a dict with ``updated_count``, ``skipped_count``, ``total_scanned``,
+        and ``samples`` (up to 5 updated accession numbers).
         """
-        import re
+        result = _backfill_filing_metadata_impl(
+            fetch_rows=lambda: self._fetch_empty_metadata_rows(),
+            update_row=lambda acc, ft: self._update_filing_type(acc, ft),
+        )
+        return result
+
+    def _fetch_empty_metadata_rows(self):
+        # type: () -> list
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT accession_number, filing_url FROM filings WHERE filing_type IS NULL OR filing_type = ''"
             )
-            rows = cur.fetchall()
-        updated = 0
-        type_pattern = re.compile(r"/(10-[QK]|8-K|6-K|20-F|S-1|DEF 14A|SC 13D)[/\b]", re.IGNORECASE)
-        for accession, url in rows:
-            match = type_pattern.search(url or "")
-            if not match:
-                continue
-            filing_type = match.group(1).upper()
-            with self._lock:
-                with self._connect() as conn:
-                    conn.execute(
-                        "UPDATE filings SET filing_type = ? WHERE accession_number = ? AND (filing_type IS NULL OR filing_type = '')",
-                        (filing_type, accession),
-                    )
-                    conn.commit()
-            updated += 1
-        return updated
+            return cur.fetchall()
+
+    def _update_filing_type(self, accession, filing_type):
+        # type: (str, str) -> bool
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE filings SET filing_type = ? WHERE accession_number = ? AND (filing_type IS NULL OR filing_type = '')",
+                    (filing_type, accession),
+                )
+                conn.commit()
+                return cur.rowcount > 0
 
     def _seed_default_ask_templates(self, conn):
         now = datetime.utcnow().isoformat()

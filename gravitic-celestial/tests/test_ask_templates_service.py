@@ -84,6 +84,47 @@ class AskTemplatesServiceTests(unittest.TestCase):
         self.assertEqual(_format_rule_hint([]), "")
 
 
+class InferFilingTypeTests(unittest.TestCase):
+    """Test the _infer_filing_type heuristic directly."""
+
+    def test_canonical_path_segments(self):
+        from core.framework.state_manager import _infer_filing_type
+
+        self.assertEqual(_infer_filing_type("https://sec.gov/Archives/edgar/data/123/10-Q/doc.htm"), "10-Q")
+        self.assertEqual(_infer_filing_type("https://sec.gov/Archives/edgar/data/123/8-K/doc.htm"), "8-K")
+        self.assertEqual(_infer_filing_type("https://sec.gov/Archives/edgar/data/123/10-K/doc.htm"), "10-K")
+        self.assertEqual(_infer_filing_type("https://sec.gov/Archives/edgar/data/123/20-F/doc.htm"), "20-F")
+
+    def test_compact_tokens_def14a(self):
+        from core.framework.state_manager import _infer_filing_type
+
+        self.assertEqual(_infer_filing_type("https://sec.gov/Archives/edgar/data/123/000/def14a.htm"), "DEF 14A")
+
+    def test_compact_tokens_sc13d(self):
+        from core.framework.state_manager import _infer_filing_type
+
+        self.assertEqual(_infer_filing_type("https://sec.gov/Archives/edgar/data/123/000/sc13d.htm"), "SC 13D")
+
+    def test_compact_tokens_in_filename(self):
+        from core.framework.state_manager import _infer_filing_type
+
+        self.assertEqual(
+            _infer_filing_type("https://sec.gov/Archives/edgar/data/123/000/msft-20240630_10q.htm"),
+            "10-Q",
+        )
+        self.assertEqual(
+            _infer_filing_type("https://sec.gov/Archives/edgar/data/123/000/aapl-20f.htm"),
+            "20-F",
+        )
+
+    def test_unknown_url_returns_none(self):
+        from core.framework.state_manager import _infer_filing_type
+
+        self.assertIsNone(_infer_filing_type("https://sec.gov/cgi-bin/browse-edgar?action=getcompany"))
+        self.assertIsNone(_infer_filing_type(""))
+        self.assertIsNone(_infer_filing_type(None))
+
+
 class StateManagerMetadataTests(unittest.TestCase):
     def test_count_filings_for_ticker(self):
         import os
@@ -101,7 +142,7 @@ class StateManagerMetadataTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_backfill_filing_metadata(self):
+    def test_backfill_canonical_urls(self):
         import os
         import tempfile
         from core.framework.state_manager import StateManager
@@ -110,7 +151,6 @@ class StateManagerMetadataTests(unittest.TestCase):
         os.close(fd)
         try:
             sm = StateManager(db_path=path)
-            # Insert filing with no filing_type
             sm.upsert_filing("ACC001", "MSFT", "https://sec.gov/Archives/edgar/data/123/10-Q/doc.htm", "ANALYZED")
             sm.upsert_filing("ACC002", "AAPL", "https://sec.gov/Archives/edgar/data/456/8-K/doc.htm", "ANALYZED")
             sm.upsert_filing("ACC003", "GOOG", "https://sec.gov/Archives/edgar/data/789/unknown/doc.htm", "ANALYZED")
@@ -118,8 +158,11 @@ class StateManagerMetadataTests(unittest.TestCase):
             sm.upsert_filing("ACC004", "TSLA", "https://sec.gov/Archives/edgar/data/000/10-K/doc.htm", "ANALYZED",
                              filing_type="10-K")
 
-            updated = sm.backfill_filing_metadata()
-            self.assertEqual(updated, 2)  # ACC001 and ACC002 updated, ACC003 unmatched, ACC004 skipped
+            result = sm.backfill_filing_metadata()
+            self.assertEqual(result["updated_count"], 2)
+            self.assertEqual(result["skipped_count"], 1)  # ACC003
+            self.assertEqual(result["total_scanned"], 3)  # ACC004 excluded (already has type)
+            self.assertIn("ACC001", result["samples"])
 
             filings = sm.list_recent_filings(limit=10)
             by_acc = {f["accession_number"]: f for f in filings}
@@ -127,6 +170,53 @@ class StateManagerMetadataTests(unittest.TestCase):
             self.assertEqual(by_acc["ACC002"]["filing_type"], "8-K")
             self.assertEqual(by_acc["ACC003"]["filing_type"], "")
             self.assertEqual(by_acc["ACC004"]["filing_type"], "10-K")
+        finally:
+            os.unlink(path)
+
+    def test_backfill_compact_tokens(self):
+        """Compact EDGAR tokens like def14a and sc13d should be recognised."""
+        import os
+        import tempfile
+        from core.framework.state_manager import StateManager
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            sm = StateManager(db_path=path)
+            sm.upsert_filing("ACC010", "MSFT", "https://sec.gov/Archives/edgar/data/123/000/def14a.htm", "ANALYZED")
+            sm.upsert_filing("ACC011", "AAPL", "https://sec.gov/Archives/edgar/data/456/000/sc13d.htm", "ANALYZED")
+            sm.upsert_filing("ACC012", "GOOG", "https://sec.gov/Archives/edgar/data/789/000/goog-20240630_10q.htm", "ANALYZED")
+
+            result = sm.backfill_filing_metadata()
+            self.assertEqual(result["updated_count"], 3)
+            self.assertEqual(result["skipped_count"], 0)
+
+            filings = sm.list_recent_filings(limit=10)
+            by_acc = {f["accession_number"]: f for f in filings}
+            self.assertEqual(by_acc["ACC010"]["filing_type"], "DEF 14A")
+            self.assertEqual(by_acc["ACC011"]["filing_type"], "SC 13D")
+            self.assertEqual(by_acc["ACC012"]["filing_type"], "10-Q")
+        finally:
+            os.unlink(path)
+
+    def test_backfill_idempotent(self):
+        """Running backfill twice should not change results."""
+        import os
+        import tempfile
+        from core.framework.state_manager import StateManager
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            sm = StateManager(db_path=path)
+            sm.upsert_filing("ACC020", "MSFT", "https://sec.gov/Archives/edgar/data/123/10-Q/doc.htm", "ANALYZED")
+
+            r1 = sm.backfill_filing_metadata()
+            self.assertEqual(r1["updated_count"], 1)
+
+            r2 = sm.backfill_filing_metadata()
+            self.assertEqual(r2["total_scanned"], 0)  # no rows left with empty type
+            self.assertEqual(r2["updated_count"], 0)
         finally:
             os.unlink(path)
 

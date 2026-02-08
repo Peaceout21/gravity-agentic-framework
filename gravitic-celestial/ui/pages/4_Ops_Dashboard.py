@@ -197,13 +197,20 @@ if st.button("Backfill filing metadata", help="Populate filing_type for old fili
         try:
             if use_api:
                 result = client.backfill_filing_metadata()
-                updated = result.get("updated", 0)
             else:
-                updated = runtime.state_manager.backfill_filing_metadata()
-            if updated > 0:
-                st.success("Updated filing_type on %d filings." % updated)
-            else:
+                result = runtime.state_manager.backfill_filing_metadata()
+            updated = result.get("updated_count", 0)
+            skipped = result.get("skipped_count", 0)
+            total = result.get("total_scanned", 0)
+            samples = result.get("samples", [])
+            if total == 0:
                 st.info("No filings needed metadata backfill.")
+            elif updated > 0:
+                st.success("Scanned %d filings: %d updated, %d skipped (unrecognized URL pattern)." % (total, updated, skipped))
+                if samples:
+                    st.caption("Sample updated accessions: %s" % ", ".join(samples))
+            else:
+                st.warning("Scanned %d filings but none matched a known URL pattern. %d skipped." % (total, skipped))
         except Exception as exc:
             st.error("Backfill failed: %s" % exc)
 
