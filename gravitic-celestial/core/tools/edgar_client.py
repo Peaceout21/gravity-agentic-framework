@@ -95,6 +95,9 @@ class EdgarClient(object):
                             filing_type=record["form"],
                             metadata={
                                 "cik": cik,
+                                "form": record["form"],
+                                "filing_type": record["form"],
+                                "item_code": record.get("items", ""),
                                 "filing_date": record.get("filingDate", ""),
                                 "primary_document": primary_doc,
                                 "directory_url": directory_url,
@@ -151,6 +154,9 @@ class EdgarClient(object):
                             filing_type=record["form"],
                             metadata={
                                 "cik": cik,
+                                "form": record["form"],
+                                "filing_type": record["form"],
+                                "item_code": record.get("items", ""),
                                 "filing_date": record.get("filingDate", ""),
                                 "primary_document": primary_doc,
                                 "directory_url": directory_url,
@@ -273,6 +279,7 @@ class EdgarClient(object):
         forms = recent.get("form", [])
         primary_docs = recent.get("primaryDocument", [])
         filing_dates = recent.get("filingDate", [])
+        items = recent.get("items", [])
 
         count = min(len(accessions), len(forms), len(primary_docs), len(filing_dates))
         rows = []
@@ -283,6 +290,7 @@ class EdgarClient(object):
                     "form": forms[idx],
                     "primaryDocument": primary_docs[idx],
                     "filingDate": filing_dates[idx],
+                    "items": items[idx] if idx < len(items) else "",
                 }
             )
         return rows

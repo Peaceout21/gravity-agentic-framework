@@ -126,6 +126,24 @@ class GravityApiClientTests(unittest.TestCase):
         client.ops_metrics(window_minutes=30)
         self.assertEqual(client._session.get.call_args[1]["headers"]["X-User-Id"], "u-1")
 
+    def test_template_methods(self):
+        client = self._make_client()
+        client._session.get.return_value = self._mock_response(
+            [{"id": 1, "template_key": "qoq_changes", "title": "Quarter-over-quarter changes"}]
+        )
+        rows = client.list_ask_templates()
+        self.assertEqual(rows[0]["id"], 1)
+        client._session.post.return_value = self._mock_response(
+            {"run_id": 12, "template_id": 1, "answer_markdown": "answer", "citations": []}
+        )
+        run_result = client.run_ask_template(template_id=1, ticker="msft")
+        self.assertEqual(run_result["run_id"], 12)
+        body = client._session.post.call_args[1]["json"]
+        self.assertEqual(body["ticker"], "MSFT")
+        client._session.get.return_value = self._mock_response([])
+        _ = client.list_template_runs(limit=5)
+        self.assertEqual(client._session.get.call_args[1]["params"]["limit"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

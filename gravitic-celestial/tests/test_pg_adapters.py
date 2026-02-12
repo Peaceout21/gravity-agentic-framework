@@ -133,6 +133,43 @@ class PostgresStateManagerTests(unittest.TestCase):
         unread = sm.list_notifications(org_id, user_id, limit=10, unread_only=True)
         self.assertEqual(len(unread), 0)
 
+    @_requires_postgres
+    def test_ask_templates_and_runs(self):
+        from core.adapters.pg_state_manager import PostgresStateManager
+
+        sm = PostgresStateManager(DATABASE_URL)
+        org_id = "org-template-test"
+        user_id = "user-template-test"
+        templates = sm.list_ask_templates(org_id, user_id)
+        self.assertGreaterEqual(len(templates), 1)
+        template = templates[0]
+        rules = sm.list_ask_template_rules(template["id"])
+        self.assertGreaterEqual(len(rules), 1)
+
+        conn = sm._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM ask_template_runs WHERE org_id = %s AND user_id = %s", (org_id, user_id))
+            conn.commit()
+        finally:
+            sm._put(conn)
+
+        run_id = sm.create_ask_template_run(
+            org_id=org_id,
+            user_id=user_id,
+            template_id=template["id"],
+            ticker="MSFT",
+            rendered_question="What changed for MSFT?",
+            relevance_label="High relevance",
+            coverage_brief="Based on analyzed filings: 10-Q (2026-01-01).",
+            answer_markdown="Answer",
+            citations=["chunk-1"],
+            latency_ms=100,
+        )
+        self.assertGreater(run_id, 0)
+        runs = sm.list_ask_template_runs(org_id, user_id, limit=5)
+        self.assertEqual(len(runs), 1)
+
 
 class PostgresCheckpointStoreTests(unittest.TestCase):
     @_requires_postgres

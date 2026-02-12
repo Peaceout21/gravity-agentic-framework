@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS filings (
     ticker           TEXT NOT NULL,
     filing_url       TEXT NOT NULL,
     status           TEXT NOT NULL,
+    filing_type      TEXT,
+    item_code        TEXT,
+    filing_date      DATE,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -59,6 +62,9 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_unread
 
 ALTER TABLE watchlists ADD COLUMN IF NOT EXISTS org_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE notifications ADD COLUMN IF NOT EXISTS org_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE filings ADD COLUMN IF NOT EXISTS filing_type TEXT;
+ALTER TABLE filings ADD COLUMN IF NOT EXISTS item_code TEXT;
+ALTER TABLE filings ADD COLUMN IF NOT EXISTS filing_date DATE;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_watchlists_org_user_ticker
     ON watchlists (org_id, user_id, ticker);
 CREATE INDEX IF NOT EXISTS idx_watchlists_org_ticker
@@ -87,6 +93,54 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw
     ON chunks USING hnsw (embedding vector_cosine_ops);
+
+-- Quick ask templates
+CREATE TABLE IF NOT EXISTS ask_templates (
+    id                BIGSERIAL PRIMARY KEY,
+    org_id            TEXT,
+    template_key      TEXT NOT NULL,
+    title             TEXT NOT NULL,
+    description       TEXT NOT NULL,
+    category          TEXT NOT NULL,
+    question_template TEXT NOT NULL,
+    requires_ticker   BOOLEAN NOT NULL DEFAULT TRUE,
+    enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+    sort_order        INTEGER NOT NULL DEFAULT 0,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ask_templates_org_key
+    ON ask_templates (COALESCE(org_id, '__global__'), template_key);
+
+CREATE TABLE IF NOT EXISTS ask_template_filing_rules (
+    id          BIGSERIAL PRIMARY KEY,
+    template_id BIGINT NOT NULL REFERENCES ask_templates(id) ON DELETE CASCADE,
+    filing_type TEXT NOT NULL,
+    item_code   TEXT NOT NULL DEFAULT '',
+    weight      DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ask_template_rules_template_id
+    ON ask_template_filing_rules (template_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ask_template_rules_unique
+    ON ask_template_filing_rules (template_id, filing_type, item_code);
+
+CREATE TABLE IF NOT EXISTS ask_template_runs (
+    id                BIGSERIAL PRIMARY KEY,
+    org_id            TEXT NOT NULL,
+    user_id           TEXT NOT NULL,
+    template_id       BIGINT NOT NULL REFERENCES ask_templates(id) ON DELETE CASCADE,
+    ticker            TEXT,
+    rendered_question TEXT NOT NULL,
+    relevance_label   TEXT NOT NULL,
+    coverage_brief    TEXT NOT NULL,
+    answer_markdown   TEXT NOT NULL,
+    citations_json    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    latency_ms        INTEGER NOT NULL DEFAULT 0,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ask_template_runs_org_user_created
+    ON ask_template_runs (org_id, user_id, created_at DESC);
 """
 
 

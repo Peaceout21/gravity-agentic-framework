@@ -26,6 +26,7 @@ class IngestionNodes(object):
                     "ticker": record.ticker,
                     "accession_number": record.accession_number,
                     "filing_url": record.filing_url,
+                    "filing_type": getattr(record, "filing_type", ""),
                     "metadata": record.metadata,
                     "record": record,
                 }
@@ -104,7 +105,19 @@ class IngestionNodes(object):
             metadata=current.get("metadata", {}),
         )
         payloads.append(payload)
-        self.state_manager.mark_ingested(payload.accession_number, payload.ticker, payload.filing_url)
+        metadata = payload.metadata or {}
+        item_code = metadata.get("item_code") or metadata.get("items") or ""
+        if isinstance(item_code, list):
+            item_code = ",".join(str(value) for value in item_code)
+        filing_date = metadata.get("filing_date") or ""
+        self.state_manager.mark_ingested(
+            payload.accession_number,
+            payload.ticker,
+            payload.filing_url,
+            filing_type=current.get("filing_type") or metadata.get("filing_type") or metadata.get("form"),
+            item_code=str(item_code),
+            filing_date=str(filing_date),
+        )
 
         if queue:
             queue = queue[1:]

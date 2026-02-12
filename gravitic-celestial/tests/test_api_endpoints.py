@@ -58,6 +58,45 @@ class ApiEndpointTests(unittest.TestCase):
             }
         ]
         state_manager.mark_notification_read.return_value = True
+        state_manager.list_ask_templates.return_value = [
+            {
+                "id": 1,
+                "template_key": "qoq_changes",
+                "title": "Quarter-over-quarter changes",
+                "description": "Summarize quarter changes",
+                "category": "overview",
+                "question_template": "What changed for {ticker}?",
+                "requires_ticker": True,
+                "enabled": True,
+                "sort_order": 10,
+            }
+        ]
+        state_manager.get_ask_template.return_value = {
+            "id": 1,
+            "template_key": "qoq_changes",
+            "title": "Quarter-over-quarter changes",
+            "description": "Summarize quarter changes",
+            "category": "overview",
+            "question_template": "What changed for {ticker}?",
+            "requires_ticker": True,
+            "enabled": True,
+            "sort_order": 10,
+        }
+        state_manager.list_recent_analyzed_filings.return_value = [
+            {
+                "accession_number": "A1",
+                "ticker": "MSFT",
+                "filing_type": "10-Q",
+                "item_code": "",
+                "filing_date": "2026-01-01",
+                "updated_at": "2026-01-01T00:00:00",
+                "status": "ANALYZED",
+                "filing_url": "http://sec.gov/a1",
+            }
+        ]
+        state_manager.list_ask_template_rules.return_value = [{"filing_type": "10-Q", "item_code": "", "weight": 1.0}]
+        state_manager.create_ask_template_run.return_value = 1001
+        state_manager.list_ask_template_runs.return_value = []
 
         graph_runtime = MagicMock()
         graph_runtime.run_ingestion_cycle.return_value = []
@@ -307,6 +346,39 @@ class ApiEndpointTests(unittest.TestCase):
             ticker="MSFT",
             notification_type="FILING_FOUND",
         )
+
+    def test_list_ask_templates(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.get("/ask/templates", headers=self._auth_headers(org_id="o1", user_id="u1"))
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.json()
+        self.assertEqual(rows[0]["template_key"], "qoq_changes")
+        mocks["state_manager"].list_ask_templates.assert_called_once_with(org_id="o1", user_id="u1")
+
+    def test_template_run_success(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/ask/template-run",
+            json={"template_id": 1, "ticker": "MSFT"},
+            headers=self._auth_headers(org_id="o1", user_id="u1"),
+        )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertEqual(payload["template_id"], 1)
+        self.assertEqual(payload["relevance_label"], "High relevance")
+        self.assertTrue(payload["answer_markdown"])
+
+    def test_template_run_requires_ticker(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/ask/template-run",
+            json={"template_id": 1},
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(resp.status_code, 400)
 
 
 if __name__ == "__main__":

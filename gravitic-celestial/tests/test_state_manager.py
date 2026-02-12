@@ -59,6 +59,33 @@ class StateManagerTests(unittest.TestCase):
             self.assertEqual(counts.get("INGESTION_CYCLE"), 2)
             self.assertEqual(counts.get("ANALYSIS_SUCCESS"), 1)
 
+    def test_ask_templates_and_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "state.db")
+            manager = StateManager(db_path=db_path)
+            templates = manager.list_ask_templates("o1", "u1")
+            self.assertGreaterEqual(len(templates), 1)
+            template_id = templates[0]["id"]
+            rules = manager.list_ask_template_rules(template_id)
+            self.assertGreaterEqual(len(rules), 1)
+
+            run_id = manager.create_ask_template_run(
+                org_id="o1",
+                user_id="u1",
+                template_id=template_id,
+                ticker="MSFT",
+                rendered_question="What changed for MSFT?",
+                relevance_label="High relevance",
+                coverage_brief="Based on analyzed filings: 10-Q (2026-01-01).",
+                answer_markdown="Answer",
+                citations=["chunk-1"],
+                latency_ms=123,
+            )
+            self.assertGreater(run_id, 0)
+            runs = manager.list_ask_template_runs("o1", "u1", limit=5)
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["relevance_label"], "High relevance")
+
 
 if __name__ == "__main__":
     unittest.main()

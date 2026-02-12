@@ -56,7 +56,19 @@ def run_backfill(graph_runtime, state_manager, request):
             raw_text=raw_text or "",
             metadata=record.metadata,
         )
-        state_manager.mark_ingested(payload.accession_number, payload.ticker, payload.filing_url)
+        metadata = payload.metadata or {}
+        item_code = metadata.get("item_code") or metadata.get("items") or ""
+        if isinstance(item_code, list):
+            item_code = ",".join(str(value) for value in item_code)
+        filing_date = metadata.get("filing_date") or ""
+        state_manager.mark_ingested(
+            payload.accession_number,
+            payload.ticker,
+            payload.filing_url,
+            filing_type=getattr(record, "filing_type", "") or metadata.get("filing_type") or metadata.get("form"),
+            item_code=str(item_code),
+            filing_date=str(filing_date),
+        )
         payloads.append(payload)
 
     if notify and payloads:
