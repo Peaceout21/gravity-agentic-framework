@@ -1,0 +1,105 @@
+Gravity Agentic Framework - Progress Log
+=======================================
+
+Purpose
+-------
+Chronological context log of experiments, decisions, and outcomes. This is a running history to preserve execution context across sessions.
+
+Format
+------
+[DATE] AREA
+- Context
+- What was tried
+- Outcome
+- Decision / Next
+
+[2026-02-06] Blueprint and architecture alignment
+- Context: Started from AGENTIC_ARCHITECTURE_BLUEPRINT.md.
+- What was tried: Locked hybrid stack (LangGraph + LangChain + SQLite checkpoints), typed payload contracts, 4-agent flow.
+- Outcome: Agreed on graph-node architecture and public interfaces.
+- Decision / Next: Implement greenfield runtime and module layout.
+
+[2026-02-07] Core implementation and testing foundation
+- Context: Needed production-ready baseline for ingestion -> analysis -> index -> ask.
+- What was tried: Implemented graphs, adapters, API/worker, Streamlit app, test scaffolding.
+- Outcome: End-to-end local path available; initial tests in place.
+- Decision / Next: Add production architecture plan and hardening items.
+
+[2026-02-07] Production architecture planning
+- Context: User target raised to 500-1000 users.
+- What was tried: Prepared production architecture guidance (API, worker, queue, DB, scaling).
+- Outcome: docs/PRODUCTION_ARCHITECTURE_IMPLEMENTATION.md created and iterated.
+- Decision / Next: implement backfill contract, auth scoping, deterministic E2E tests.
+
+[2026-02-08] Reliability and release checks
+- Context: Live integration sometimes skipped due to API not running.
+- What was tried: Added/ran release checks and clarified test expectations for reachable/unreachable env.
+- Outcome: Integration test behavior documented; suite can pass with intentional skip semantics.
+- Decision / Next: keep release gate requiring green OR explicit skip-by-design evidence.
+
+[2026-02-08] UX and operations expansion
+- Context: Need productized experience for analysts and ops users.
+- What was tried: Added multi-page Streamlit UX (Dashboard, Notifications, Watchlist, Ask, Ops Dashboard), API endpoints for ops and notification management.
+- Outcome: Full user journey became demo-ready in local mode/API mode.
+- Decision / Next: improve Ask usefulness and filing coverage clarity.
+
+[2026-02-09] Ask templates and filing-aware guidance
+- Context: Analysts needed guided prompts and better context when coverage is missing.
+- What was tried: Template runs, period picker, persisted history merge, metadata backfill path, low-relevance coverage brief.
+- Outcome: Ask workflow now supports repeatable template analysis and clearer user feedback.
+- Decision / Next: validate UI behavior and harden release readiness.
+
+[2026-02-10] Release hardening
+- Context: Need deterministic branch state and release confidence.
+- What was tried: status checks, staging/commit hygiene, rerun suite in release-like env, tag guidance.
+- Outcome: release process clarified with explicit gates.
+- Decision / Next: proceed only after deterministic branch and validated suite.
+
+[2026-02-16] India market experiment (separate branch)
+- Context: Explore expansion beyond US SEC.
+- What was tried:
+  - Added market provider abstraction + factory.
+  - Implemented IN_NSE and IN_BSE provider adapters.
+  - Made API/worker/watchlist/notifications market-aware.
+  - Added tests for provider logic and multi-market behavior.
+- Outcome:
+  - Local tests passed.
+  - Live runs for BHEL/NALCO/Bharat Coking Coal returned 0 records; observed NSE timeouts and source variability.
+- Decision / Next:
+  - Keep this track experimental on separate branch.
+  - Do not block US SEC release path.
+
+[2026-02-16] SEA market research
+- Context: Evaluate additional growth markets at practical cost.
+- What was tried: Assessed exchange/operator data options and implementation implications for SEA markets.
+- Outcome: Confirmed feeds exist but access/cost/reliability vary; integration is feasible but requires source-level contracts.
+- Decision / Next: prioritize shippable core (US SEC) first; treat new markets as staged experiments.
+
+[2026-02-17] Rollout and documentation consolidation
+- Context: Need investor/ops-friendly execution clarity and preserved context.
+- What was tried: Added rollout matrix and maintained this progress log.
+- Outcome: Shared artifact set now includes journey, production architecture, rollout matrix, and progress history.
+- Decision / Next:
+  - Continue appending entries for every major experiment/release decision.
+  - Use rollout gates as go/no-go checklist for launch.
+
+[2026-02-17] SOTA implementation planning kickoff
+- Context: Need a concrete implementation path using latest practical agentic patterns without coupling to India experiment branch.
+- What was tried: Added a dedicated SOTA plan covering reliability core, metric-derivation agent, coverage assessor, observability, and scale gates.
+- Outcome: Clear phased execution plan with release-critical tests and API contract additions.
+- Decision / Next:
+  - Execute P0 workstreams first (reliability, ask quality, tenant safety).
+  - Track each implementation milestone in this log and validate against rollout matrix gates.
+
+Open Threads
+------------
+1. Finalize US SEC go-live checklist run and tag.
+2. Validate notification UX and Ask template metrics under real analyst usage.
+3. Decide if/when to revive India/SEA experimental branch based on data source economics.
+4. Add periodic summary script to auto-append run outcomes to this log (optional).
+
+How to maintain this file
+-------------------------
+- Append new entries only; do not rewrite prior outcomes unless correcting facts.
+- Keep each entry short and decision-focused.
+- For each release candidate, include: test status, incident summary, and explicit go/no-go decision.
