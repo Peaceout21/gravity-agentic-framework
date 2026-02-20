@@ -6,6 +6,10 @@ from core.framework.messages import AnalysisPayload, FilingPayload, IndexReceipt
 
 
 class GraphState(TypedDict, total=False):
+    market: str
+    exchange: str
+    issuer_id: str
+    source_event_id: str
     ticker: str
     accession_number: str
     filing_url: str
@@ -22,6 +26,8 @@ class GraphState(TypedDict, total=False):
     question: str
     answer: str
     answer_citations: List[str]
+    answer_confidence: float
+    derivation_trace: List[str]
     errors: List[str]
     trace: List[str]
     reflection_attempted: bool

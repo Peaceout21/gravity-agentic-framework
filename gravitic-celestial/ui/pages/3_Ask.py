@@ -3,6 +3,7 @@
 import streamlit as st
 
 from ui.components import inject_css, require_backend, setup_auth_sidebar, ticker_badge
+from ui.confidence import confidence_label, low_confidence_warning, normalize_confidence
 
 inject_css()
 
@@ -109,6 +110,17 @@ def _render_history(entries):
         st.markdown(header, unsafe_allow_html=True)
         if entry.get("relevance_label"):
             st.caption("%s | %s" % (entry.get("relevance_label", ""), entry.get("coverage_brief", "")))
+        if "confidence" in entry:
+            score = normalize_confidence(entry.get("confidence", 0.0))
+            st.caption(confidence_label(score))
+            warning = low_confidence_warning(score)
+            if warning:
+                st.warning(warning)
+        trace = entry.get("derivation_trace", []) or []
+        if trace:
+            with st.expander("How this was derived", expanded=False):
+                for step in trace:
+                    st.markdown("- %s" % step)
         st.markdown(entry.get("answer") or entry.get("answer_markdown", ""))
         citations = entry.get("citations", [])
         if citations:
@@ -159,6 +171,8 @@ with tab_templates:
                             "coverage_brief": result.get("coverage_brief", ""),
                             "answer": result.get("answer_markdown", ""),
                             "citations": result.get("citations", []),
+                            "confidence": result.get("confidence", 0.0),
+                            "derivation_trace": result.get("derivation_trace", []),
                             "run_id": result.get("run_id"),
                         }
                     )
@@ -213,10 +227,14 @@ with tab_freeform:
                     result = client.query(question.strip(), ticker=ticker_context.strip() or None)
                     answer_md = result.get("answer_markdown", "No answer generated.")
                     citations = result.get("citations", [])
+                    confidence = result.get("confidence", 0.0)
+                    derivation_trace = result.get("derivation_trace", [])
                 else:
-                    answer = runtime.synthesis_agent.answer(question.strip())
+                    answer = runtime.graph_runtime.answer_question(question.strip(), ticker=ticker_context.strip() or None)
                     answer_md = answer.answer_markdown
                     citations = answer.citations
+                    confidence = getattr(answer, "confidence", 0.0)
+                    derivation_trace = getattr(answer, "derivation_trace", [])
 
                 st.session_state.qa_history.append(
                     {
@@ -224,6 +242,8 @@ with tab_freeform:
                         "ticker": ticker_context.strip().upper() if ticker_context.strip() else None,
                         "answer": answer_md,
                         "citations": citations,
+                        "confidence": confidence,
+                        "derivation_trace": derivation_trace,
                     }
                 )
             except Exception as exc:
@@ -233,6 +253,8 @@ with tab_freeform:
                         "ticker": ticker_context.strip().upper() if ticker_context.strip() else None,
                         "answer": "Error: %s" % exc,
                         "citations": [],
+                        "confidence": 0.0,
+                        "derivation_trace": [],
                     }
                 )
 

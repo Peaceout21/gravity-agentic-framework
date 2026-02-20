@@ -23,6 +23,7 @@ from ui.components import (
     setup_auth_sidebar,
     ticker_badge,
 )
+from ui.confidence import confidence_label, low_confidence_warning
 
 inject_css()
 
@@ -182,6 +183,15 @@ with right:
                             params=_params or None,
                         )
                     st.caption("%s | %s" % (result.get("relevance_label", ""), result.get("coverage_brief", "")))
+                    st.caption(confidence_label(result.get("confidence", 0.0)))
+                    _template_warning = low_confidence_warning(result.get("confidence", 0.0))
+                    if _template_warning:
+                        st.warning(_template_warning)
+                    _trace = result.get("derivation_trace", []) or []
+                    if _trace:
+                        with st.expander("How this was derived", expanded=False):
+                            for _step in _trace:
+                                st.markdown("- %s" % _step)
                     st.markdown(result.get("answer_markdown", "No answer generated."))
                     if result.get("citations"):
                         st.caption("Sources: %s" % ", ".join(result["citations"]))
@@ -217,10 +227,23 @@ with right:
                         result = client.query(question.strip(), ticker=ticker_filter.strip() or None)
                         st.markdown(result.get("answer_markdown", "No answer generated."))
                         citations = result.get("citations", [])
+                        confidence = result.get("confidence", 0.0)
+                        derivation_trace = result.get("derivation_trace", [])
                     else:
-                        answer = runtime.synthesis_agent.answer(question.strip())
+                        answer = runtime.graph_runtime.answer_question(question.strip(), ticker=ticker_filter.strip() or None)
                         st.markdown(answer.answer_markdown)
                         citations = answer.citations
+                        confidence = getattr(answer, "confidence", 0.0)
+                        derivation_trace = getattr(answer, "derivation_trace", [])
+
+                    st.caption(confidence_label(confidence))
+                    _warning = low_confidence_warning(confidence)
+                    if _warning:
+                        st.warning(_warning)
+                    if derivation_trace:
+                        with st.expander("How this was derived", expanded=False):
+                            for _step in derivation_trace:
+                                st.markdown("- %s" % _step)
 
                     if citations:
                         st.caption("Sources: %s" % ", ".join(citations))

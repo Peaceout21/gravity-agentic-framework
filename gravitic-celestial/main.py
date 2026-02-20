@@ -14,8 +14,8 @@ from core.agents.synthesis_agent import SynthesisAgent
 from core.adapters.factory import create_backends
 from core.framework.event_bus import EventBus
 from core.graph.builder import GraphRuntime
-from core.tools.edgar_client import EdgarClient
 from core.tools.extraction_engine import ExtractionEngine, GeminiAdapter, SynthesisEngine
+from core.tools.provider_factory import create_market_provider
 
 
 class FrameworkRuntime(object):
@@ -23,6 +23,7 @@ class FrameworkRuntime(object):
         load_dotenv()
 
         sec_identity = os.getenv("SEC_IDENTITY", "Unknown unknown@example.com")
+        default_market = (os.getenv("GRAVITY_MARKET_DEFAULT", "US_SEC") or "US_SEC").strip().upper()
         gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         gemini_model = os.getenv("GEMINI_MODEL")
 
@@ -31,7 +32,7 @@ class FrameworkRuntime(object):
 
         self.event_bus = EventBus()
         self.state_manager = backends["state_manager"]
-        self.edgar_client = EdgarClient(sec_identity=sec_identity)
+        self.edgar_client = create_market_provider(market=default_market, sec_identity=sec_identity)
         self.extraction_engine = ExtractionEngine(adapter=GeminiAdapter(api_key=gemini_api_key, model_name=gemini_model))
         self.synthesis_engine = SynthesisEngine(adapter=GeminiAdapter(api_key=gemini_api_key, model_name=gemini_model))
         self.rag_engine = backends["rag_engine"]

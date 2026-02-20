@@ -69,6 +69,21 @@ class FactoryDefaultTests(unittest.TestCase):
             if db_backup is not None:
                 os.environ["DATABASE_URL"] = db_backup
 
+    def test_market_provider_factory_supports_india(self):
+        from core.tools.provider_factory import create_market_provider, supported_markets
+
+        markets = supported_markets()
+        self.assertIn("US_SEC", markets)
+        self.assertIn("IN_NSE", markets)
+        self.assertIn("IN_BSE", markets)
+
+        nse = create_market_provider("IN_NSE", sec_identity="x y")
+        bse = create_market_provider("IN_BSE", sec_identity="x y")
+        us = create_market_provider("US_SEC", sec_identity="x y")
+        self.assertEqual(getattr(nse, "market_code", None), "IN_NSE")
+        self.assertEqual(getattr(bse, "market_code", None), "IN_BSE")
+        self.assertEqual(getattr(us, "market_code", None), "US_SEC")
+
 
 if __name__ == "__main__":
     unittest.main()

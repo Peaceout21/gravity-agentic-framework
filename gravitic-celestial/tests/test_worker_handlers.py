@@ -62,6 +62,20 @@ class WorkerHandlerTests(unittest.TestCase):
             mock_state_manager, mock_runtime.run_ingestion_cycle.return_value, org_id="default"
         )
 
+    def test_handle_ingestion_accepts_market_payload(self):
+        mock_runtime = MagicMock()
+        mock_runtime.run_ingestion_cycle.return_value = []
+        mock_state_manager = MagicMock()
+        worker._worker_cache["backends"] = {"state_manager": mock_state_manager}
+
+        with patch.object(worker, "_get_runtime", return_value=mock_runtime), patch.object(
+            worker, "_get_job_queue", return_value=MagicMock()
+        ), patch("services.notifications.create_filing_notifications", return_value=0):
+            result = worker.handle_ingestion({"tickers": ["MSFT"], "market": "US_SEC", "exchange": "SEC"})
+
+        self.assertEqual(result["filings_found"], 0)
+        mock_runtime.run_ingestion_cycle.assert_called_once_with(["MSFT"], market="US_SEC", exchange="SEC")
+
     def test_handle_analysis_enqueues_knowledge_when_analysis_succeeds(self):
         mock_runtime = MagicMock()
         mock_analysis = DummyPayload(

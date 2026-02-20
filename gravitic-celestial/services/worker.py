@@ -27,12 +27,13 @@ def _get_runtime():
 
     from core.adapters.factory import create_backends
     from core.graph.builder import GraphRuntime
-    from core.tools.edgar_client import EdgarClient
     from core.tools.extraction_engine import ExtractionEngine, GeminiAdapter, SynthesisEngine
+    from core.tools.provider_factory import create_market_provider
 
     backends = create_backends()
 
     sec_identity = os.getenv("SEC_IDENTITY", "Unknown unknown@example.com")
+    default_market = (os.getenv("GRAVITY_MARKET_DEFAULT", "US_SEC") or "US_SEC").strip().upper()
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     gemini_model = os.getenv("GEMINI_MODEL")
     adapter = GeminiAdapter(api_key=gemini_key, model_name=gemini_model)
@@ -40,7 +41,7 @@ def _get_runtime():
     _worker_cache["backends"] = backends
     _worker_cache["graph_runtime"] = GraphRuntime(
         state_manager=backends["state_manager"],
-        edgar_client=EdgarClient(sec_identity=sec_identity),
+        edgar_client=create_market_provider(market=default_market, sec_identity=sec_identity),
         extraction_engine=ExtractionEngine(adapter=adapter),
         rag_engine=backends["rag_engine"],
         synthesis_engine=SynthesisEngine(adapter=GeminiAdapter(api_key=gemini_key, model_name=gemini_model)),
@@ -48,6 +49,20 @@ def _get_runtime():
         checkpoint_store=backends["checkpoint_store"],
     )
     return _worker_cache["graph_runtime"]
+
+
+def _ensure_market_provider(market):
+    # type: (str) -> None
+    from core.tools.provider_factory import create_market_provider
+
+    normalized = (market or "US_SEC").strip().upper()
+    gr = _get_runtime()
+    current = getattr(gr.ingestion_nodes, "edgar_client", None)
+    current_market = getattr(current, "market_code", None)
+    if current_market == normalized:
+        return
+    sec_identity = os.getenv("SEC_IDENTITY", "Unknown unknown@example.com")
+    gr.ingestion_nodes.edgar_client = create_market_provider(market=normalized, sec_identity=sec_identity)
 
 
 def _get_job_queue():
@@ -60,17 +75,25 @@ def _get_job_queue():
 # Job handlers (referenced by string in rq enqueue)
 # ---------------------------------------------------------------------------
 
-def handle_ingestion(tickers):
+def handle_ingestion(ingestion_request):
     """Run ingestion cycle for the given tickers.
 
     For each filing discovered, enqueues an analysis job.
     """
-    logger.info("handle_ingestion: tickers=%s", tickers)
+    tickers = ingestion_request
+    market = "US_SEC"
+    exchange = ""
+    if isinstance(ingestion_request, dict):
+        tickers = ingestion_request.get("tickers", [])
+        market = (ingestion_request.get("market", "US_SEC") or "US_SEC").strip().upper()
+        exchange = (ingestion_request.get("exchange") or "").strip().upper()
+    logger.info("handle_ingestion: tickers=%s market=%s exchange=%s", tickers, market, exchange)
     gr = _get_runtime()
+    _ensure_market_provider(market)
     backends = _worker_cache.get("backends", {})
     from services.notifications import create_filing_notifications
 
-    payloads = gr.run_ingestion_cycle(tickers)
+    payloads = gr.run_ingestion_cycle(tickers, market=market, exchange=exchange)
     create_filing_notifications(backends["state_manager"], payloads, org_id="default")
     logger.info("Ingestion found %d filings", len(payloads))
 
@@ -91,6 +114,8 @@ def handle_backfill(backfill_request):
     logger.info("handle_backfill: tickers=%s", backfill_request.get("tickers", []))
     from services.backfill import run_backfill
 
+    market = (backfill_request.get("market", "US_SEC") or "US_SEC").strip().upper()
+    _ensure_market_provider(market)
     gr = _get_runtime()
     backends = _worker_cache.get("backends", {})
     result = run_backfill(gr, backends["state_manager"], backfill_request)

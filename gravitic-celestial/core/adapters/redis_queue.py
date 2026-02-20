@@ -32,16 +32,20 @@ class RedisJobQueue(object):
     def redis(self):
         return self._redis
 
-    def enqueue_ingestion(self, tickers):
-        # type: (List[str]) -> str
+    def enqueue_ingestion(self, ingestion_request):
+        # type: (Any) -> str
         """Enqueue an ingestion job. Returns the rq job ID."""
+        payload = ingestion_request
+        if isinstance(ingestion_request, list):
+            payload = {"tickers": ingestion_request, "market": "US_SEC", "exchange": ""}
+
         job = self._queues[QUEUE_INGESTION].enqueue(
             "services.worker.handle_ingestion",
-            tickers,
+            payload,
             job_timeout="10m",
             retry=_retry(2),
         )
-        logger.info("Enqueued ingestion job %s for tickers=%s", job.id, tickers)
+        logger.info("Enqueued ingestion job %s payload=%s", job.id, payload)
         return job.id
 
     def enqueue_analysis(self, filing_payload_dict):

@@ -91,6 +91,60 @@ Format
   - Execute P0 workstreams first (reliability, ask quality, tenant safety).
   - Track each implementation milestone in this log and validate against rollout matrix gates.
 
+[2026-02-17] P0 reliability sprint - replay + dead-letter diagnostics
+- Context: Needed concrete P0 execution (not only planning) for production hardening.
+- What was tried:
+  - Added filing replay API contract (`POST /filings/replay`) and runtime replay execution path.
+  - Added dead-letter persistence fields on filings (`dead_letter_reason`, `last_error`) plus replay tracking (`replay_count`, `last_replay_at`).
+  - Added strict runtime payload coercion/validation in graph runtime for filing/analysis/receipt contracts.
+- Outcome:
+  - Replay is now callable via API and client wrapper.
+  - Failure triage has direct root-cause fields in filings/recent failures.
+  - Contract mismatches are surfaced early and recorded in errors/dead-letter metadata.
+- Decision / Next:
+  - Start next P0 item: Ask quality uplift via metric-derivation node + coverage scoring wiring.
+  - Add replay button/action in Ops UI after API contract stabilization.
+
+[2026-02-17] P0 tenant-safety hardening - watchlist scope enforcement
+- Context: Remaining filing endpoints exposed broader dataset than user watchlist scope.
+- What was tried:
+  - Scoped `/filings` results to authenticated user watchlist tickers.
+  - Scoped `/filings/ticker-count` to watchlist; non-watched tickers return zero.
+  - Scoped `/filings/replay` to watched tickers; out-of-scope replay returns 403.
+  - Added endpoint tests for scoped/forbidden behaviors.
+- Outcome:
+  - Tenant-facing filing actions now align with watchlist-based row-level access policy.
+  - Full test suite stayed green after scoping changes.
+- Decision / Next:
+  - Continue with remaining P0: Ask quality uplift (metric derivation + provenance fields).
+
+[2026-02-17] P0 ask quality uplift - metric derivation and provenance
+- Context: Ask responses needed explicit inference confidence and traceability for derived metrics.
+- What was tried:
+  - Added a bounded `derive_metric` node to the query graph between retrieval fusion and synthesis.
+  - Propagated `confidence` and `derivation_trace` through `MarkdownAnswer`, API query responses, and template run responses/history.
+  - Extended SQLite/Postgres `ask_template_runs` schema and state manager methods to persist confidence + derivation trace.
+  - Added unit test coverage for derivation behavior and persistence contract.
+- Outcome:
+  - Derived metric outputs now include auditable reasoning metadata.
+  - Analyst-facing template history can show confidence/trace consistently across sessions.
+  - Full test suite remains green.
+- Decision / Next:
+  - Wire these fields into Ask/Dashboard UI rendering.
+  - Add policy thresholds (e.g., low-confidence labeling) for analyst trust cues.
+
+[2026-02-20] P0 UI trust cues - confidence and derivation surfaced
+- Context: Derivation/confidence existed in backend contracts but was not visible to end-users in primary UI paths.
+- What was tried:
+  - Added shared confidence policy helper with deterministic thresholds (high/medium/low).
+  - Rendered confidence labels, low-confidence warning text, and derivation trace expanders in Ask and Dashboard quick ask/template flows.
+  - Added UI helper unit tests and re-ran full suite.
+- Outcome:
+  - Analysts now see confidence + reasoning breadcrumbs directly where answers are consumed.
+  - Full suite remained green after UI wiring.
+- Decision / Next:
+  - Add optional Ops visibility for low-confidence answer rates and template-level quality trends.
+
 Open Threads
 ------------
 1. Finalize US SEC go-live checklist run and tag.

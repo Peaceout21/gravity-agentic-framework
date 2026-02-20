@@ -17,6 +17,23 @@ class StateManagerTests(unittest.TestCase):
             filings = manager.list_recent_filings(limit=1)
             self.assertEqual(filings[0]["status"], "ANALYZED")
 
+    def test_dead_letter_reason_and_replay_tracking(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "state.db")
+            manager = StateManager(db_path=db_path)
+            manager.mark_ingested("A2", "AAPL", "http://f")
+            manager.mark_dead_letter("A2", "AAPL", "http://f", reason="validation_failed", error="missing_kpi")
+            filing = manager.get_filing("A2")
+            self.assertEqual(filing["status"], "DEAD_LETTER")
+            self.assertEqual(filing["dead_letter_reason"], "validation_failed")
+            self.assertEqual(filing["last_error"], "missing_kpi")
+            self.assertEqual(filing["replay_count"], 0)
+
+            manager.mark_replay_attempt("A2")
+            filing_after = manager.get_filing("A2")
+            self.assertEqual(filing_after["replay_count"], 1)
+            self.assertTrue(bool(filing_after["last_replay_at"]))
+
     def test_watchlist_and_notifications(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "state.db")
@@ -79,12 +96,16 @@ class StateManagerTests(unittest.TestCase):
                 coverage_brief="Based on analyzed filings: 10-Q (2026-01-01).",
                 answer_markdown="Answer",
                 citations=["chunk-1"],
+                confidence=0.78,
+                derivation_trace=["Used Q4 revenue and prior quarter revenue", "Computed growth percentage"],
                 latency_ms=123,
             )
             self.assertGreater(run_id, 0)
             runs = manager.list_ask_template_runs("o1", "u1", limit=5)
             self.assertEqual(len(runs), 1)
             self.assertEqual(runs[0]["relevance_label"], "High relevance")
+            self.assertAlmostEqual(runs[0]["confidence"], 0.78, places=2)
+            self.assertEqual(len(runs[0]["derivation_trace"]), 2)
 
 
 if __name__ == "__main__":

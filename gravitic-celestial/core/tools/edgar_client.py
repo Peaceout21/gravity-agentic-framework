@@ -18,6 +18,13 @@ class FilingRecord(object):
     accession_number: str
     filing_url: str
     filing_type: str = "8-K"
+    market: str = "US_SEC"
+    exchange: str = "SEC"
+    issuer_id: str = ""
+    source: str = "sec"
+    source_event_id: str = ""
+    document_type: str = ""
+    currency: str = "USD"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

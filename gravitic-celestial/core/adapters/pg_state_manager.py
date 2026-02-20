@@ -56,8 +56,17 @@ class PostgresStateManager(object):
         filing_type=None,
         item_code=None,
         filing_date=None,
+        market="US_SEC",
+        exchange="",
+        issuer_id="",
+        source="",
+        source_event_id="",
+        document_type="",
+        currency="",
+        dead_letter_reason=None,
+        last_error=None,
     ):
-        # type: (str, str, str, str, Optional[str], Optional[str], Optional[str]) -> None
+        # type: (str, str, str, str, Optional[str], Optional[str], Optional[str], str, str, str, str, str, str, str) -> None
         now = datetime.utcnow()
         conn = self._conn()
         try:
@@ -66,12 +75,23 @@ class PostgresStateManager(object):
                     """
                     INSERT INTO filings (
                         accession_number, ticker, filing_url, status,
+                        dead_letter_reason, last_error,
+                        market, exchange, issuer_id, source, source_event_id, document_type, currency,
                         filing_type, item_code, filing_date, created_at, updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (accession_number)
                     DO UPDATE SET
                         status = EXCLUDED.status,
+                        dead_letter_reason = EXCLUDED.dead_letter_reason,
+                        last_error = EXCLUDED.last_error,
+                        market = COALESCE(EXCLUDED.market, filings.market),
+                        exchange = COALESCE(EXCLUDED.exchange, filings.exchange),
+                        issuer_id = COALESCE(EXCLUDED.issuer_id, filings.issuer_id),
+                        source = COALESCE(EXCLUDED.source, filings.source),
+                        source_event_id = COALESCE(EXCLUDED.source_event_id, filings.source_event_id),
+                        document_type = COALESCE(EXCLUDED.document_type, filings.document_type),
+                        currency = COALESCE(EXCLUDED.currency, filings.currency),
                         filing_type = COALESCE(EXCLUDED.filing_type, filings.filing_type),
                         item_code = COALESCE(EXCLUDED.item_code, filings.item_code),
                         filing_date = COALESCE(EXCLUDED.filing_date, filings.filing_date),
@@ -82,6 +102,15 @@ class PostgresStateManager(object):
                         ticker,
                         filing_url,
                         status,
+                        dead_letter_reason,
+                        last_error,
+                        (market or "US_SEC"),
+                        exchange or "",
+                        issuer_id or "",
+                        source or "",
+                        source_event_id or "",
+                        document_type or "",
+                        currency or "",
                         filing_type,
                         item_code,
                         filing_date,
@@ -93,7 +122,22 @@ class PostgresStateManager(object):
         finally:
             self._put(conn)
 
-    def mark_ingested(self, accession_number, ticker, filing_url, filing_type=None, item_code=None, filing_date=None):
+    def mark_ingested(
+        self,
+        accession_number,
+        ticker,
+        filing_url,
+        filing_type=None,
+        item_code=None,
+        filing_date=None,
+        market="US_SEC",
+        exchange="",
+        issuer_id="",
+        source="",
+        source_event_id="",
+        document_type="",
+        currency="",
+    ):
         self.upsert_filing(
             accession_number,
             ticker,
@@ -102,16 +146,92 @@ class PostgresStateManager(object):
             filing_type=filing_type,
             item_code=item_code,
             filing_date=filing_date,
+            market=market,
+            exchange=exchange,
+            issuer_id=issuer_id,
+            source=source,
+            source_event_id=source_event_id,
+            document_type=document_type,
+            currency=currency,
         )
 
     def mark_analyzed(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "ANALYZED")
+        self.upsert_filing(accession_number, ticker, filing_url, "ANALYZED", dead_letter_reason=None, last_error=None)
 
     def mark_analyzed_not_indexed(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "ANALYZED_NOT_INDEXED")
+        self.upsert_filing(
+            accession_number, ticker, filing_url, "ANALYZED_NOT_INDEXED", dead_letter_reason=None, last_error=None
+        )
 
-    def mark_dead_letter(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "DEAD_LETTER")
+    def mark_dead_letter(self, accession_number, ticker, filing_url, reason=None, error=None):
+        self.upsert_filing(
+            accession_number,
+            ticker,
+            filing_url,
+            "DEAD_LETTER",
+            dead_letter_reason=(reason or ""),
+            last_error=(error or ""),
+        )
+
+    def get_filing(self, accession_number):
+        # type: (str) -> Optional[Dict[str, Any]]
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT accession_number, ticker, filing_url, status, dead_letter_reason, last_error, replay_count, last_replay_at,
+                           market, exchange, issuer_id, source, source_event_id, document_type, currency,
+                           filing_type, item_code, filing_date, created_at, updated_at
+                    FROM filings
+                    WHERE accession_number = %s
+                    """,
+                    (accession_number,),
+                )
+                row = cur.fetchone()
+        finally:
+            self._put(conn)
+        if not row:
+            return None
+        return {
+            "accession_number": row[0],
+            "ticker": row[1],
+            "filing_url": row[2],
+            "status": row[3],
+            "dead_letter_reason": row[4] or "",
+            "last_error": row[5] or "",
+            "replay_count": int(row[6] or 0),
+            "last_replay_at": row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7] or ""),
+            "market": row[8] or "US_SEC",
+            "exchange": row[9] or "",
+            "issuer_id": row[10] or "",
+            "source": row[11] or "",
+            "source_event_id": row[12] or "",
+            "document_type": row[13] or "",
+            "currency": row[14] or "",
+            "filing_type": row[15] or "",
+            "item_code": row[16] or "",
+            "filing_date": row[17].isoformat() if hasattr(row[17], "isoformat") else str(row[17] or ""),
+            "created_at": row[18].isoformat() if hasattr(row[18], "isoformat") else str(row[18] or ""),
+            "updated_at": row[19].isoformat() if hasattr(row[19], "isoformat") else str(row[19] or ""),
+        }
+
+    def mark_replay_attempt(self, accession_number):
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE filings
+                    SET replay_count = COALESCE(replay_count, 0) + 1,
+                        last_replay_at = now()
+                    WHERE accession_number = %s
+                    """,
+                    (accession_number,),
+                )
+            conn.commit()
+        finally:
+            self._put(conn)
 
     # ------------------------------------------------------------------
     # Event log
@@ -139,7 +259,9 @@ class PostgresStateManager(object):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT accession_number, ticker, filing_url, status, filing_type, item_code, filing_date, updated_at
+                    SELECT accession_number, ticker, filing_url, status, dead_letter_reason, last_error, replay_count, last_replay_at,
+                           market, exchange, issuer_id, source, source_event_id,
+                           document_type, currency, filing_type, item_code, filing_date, updated_at
                     FROM filings
                     ORDER BY updated_at DESC
                     LIMIT %s
@@ -156,84 +278,135 @@ class PostgresStateManager(object):
                 "ticker": row[1],
                 "filing_url": row[2],
                 "status": row[3],
-                "filing_type": row[4] or "",
-                "item_code": row[5] or "",
-                "filing_date": row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6] or ""),
-                "updated_at": row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7]),
+                "dead_letter_reason": row[4] or "",
+                "last_error": row[5] or "",
+                "replay_count": int(row[6] or 0),
+                "last_replay_at": row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7] or ""),
+                "market": row[8] or "US_SEC",
+                "exchange": row[9] or "",
+                "issuer_id": row[10] or "",
+                "source": row[11] or "",
+                "source_event_id": row[12] or "",
+                "document_type": row[13] or "",
+                "currency": row[14] or "",
+                "filing_type": row[15] or "",
+                "item_code": row[16] or "",
+                "filing_date": row[17].isoformat() if hasattr(row[17], "isoformat") else str(row[17] or ""),
+                "updated_at": row[18].isoformat() if hasattr(row[18], "isoformat") else str(row[18]),
             }
             for row in rows
         ]
 
-    def add_watchlist_ticker(self, org_id, user_id, ticker):
+    def add_watchlist_ticker(self, org_id, user_id, ticker, market="US_SEC", exchange=""):
         conn = self._conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO watchlists(org_id, user_id, ticker)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (org_id, user_id, ticker) DO NOTHING
+                    INSERT INTO watchlists(org_id, user_id, ticker, market, exchange)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (org_id, user_id, ticker) DO UPDATE SET
+                        market = EXCLUDED.market,
+                        exchange = EXCLUDED.exchange
                     """,
-                    (org_id, user_id, ticker.upper()),
+                    (org_id, user_id, ticker.upper(), (market or "US_SEC").upper(), (exchange or "").upper()),
                 )
             conn.commit()
         finally:
             self._put(conn)
 
-    def remove_watchlist_ticker(self, org_id, user_id, ticker):
+    def remove_watchlist_ticker(self, org_id, user_id, ticker, market=None, exchange=None):
         conn = self._conn()
         try:
+            query = "DELETE FROM watchlists WHERE org_id = %s AND user_id = %s AND ticker = %s"
+            params = [org_id, user_id, ticker.upper()]
+            if market:
+                query += " AND market = %s"
+                params.append(market.upper())
+            if exchange:
+                query += " AND exchange = %s"
+                params.append(exchange.upper())
             with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM watchlists WHERE org_id = %s AND user_id = %s AND ticker = %s",
-                    (org_id, user_id, ticker.upper()),
-                )
+                cur.execute(query, tuple(params))
             conn.commit()
         finally:
             self._put(conn)
 
-    def list_watchlist(self, org_id, user_id):
+    def list_watchlist(self, org_id, user_id, market=None):
         conn = self._conn()
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT ticker, created_at
+            query = """
+                    SELECT ticker, market, exchange, created_at
                     FROM watchlists
                     WHERE org_id = %s AND user_id = %s
-                    ORDER BY ticker ASC
-                    """,
-                    (org_id, user_id),
-                )
+                """
+            params = [org_id, user_id]
+            if market:
+                query += " AND market = %s"
+                params.append(market.upper())
+            query += " ORDER BY ticker ASC"
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(params))
                 rows = cur.fetchall()
         finally:
             self._put(conn)
         return [
-            {"ticker": row[0], "created_at": row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1])}
+            {
+                "ticker": row[0],
+                "market": row[1] or "US_SEC",
+                "exchange": row[2] or "",
+                "created_at": row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
+            }
             for row in rows
         ]
 
-    def list_watchlist_subscribers(self, org_id, ticker):
+    def list_watchlist_subscribers(self, org_id, ticker, market="US_SEC", exchange=None):
         conn = self._conn()
         try:
+            query = "SELECT user_id FROM watchlists WHERE org_id = %s AND ticker = %s AND market = %s"
+            params = [org_id, ticker.upper(), (market or "US_SEC").upper()]
+            if exchange:
+                query += " AND exchange = %s"
+                params.append(exchange.upper())
             with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM watchlists WHERE org_id = %s AND ticker = %s", (org_id, ticker.upper()))
+                cur.execute(query, tuple(params))
                 rows = cur.fetchall()
         finally:
             self._put(conn)
         return [row[0] for row in rows]
 
-    def create_notification(self, org_id, user_id, ticker, accession_number, notification_type, title, body):
+    def create_notification(
+        self,
+        org_id,
+        user_id,
+        ticker,
+        accession_number,
+        notification_type,
+        title,
+        body,
+        market="US_SEC",
+        exchange="",
+    ):
         conn = self._conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO notifications(
-                        org_id, user_id, ticker, accession_number, notification_type, title, body, is_read
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
+                        org_id, user_id, ticker, market, exchange, accession_number, notification_type, title, body, is_read
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
                     """,
-                    (org_id, user_id, ticker.upper(), accession_number, notification_type, title, body),
+                    (
+                        org_id,
+                        user_id,
+                        ticker.upper(),
+                        (market or "US_SEC").upper(),
+                        (exchange or "").upper(),
+                        accession_number,
+                        notification_type,
+                        title,
+                        body,
+                    ),
                 )
             conn.commit()
         finally:
@@ -244,7 +417,7 @@ class PostgresStateManager(object):
         try:
             with conn.cursor() as cur:
                 query = """
-                    SELECT id, org_id, user_id, ticker, accession_number, notification_type, title, body, is_read, created_at
+                    SELECT id, org_id, user_id, ticker, market, exchange, accession_number, notification_type, title, body, is_read, created_at
                     FROM notifications
                     WHERE org_id = %s AND user_id = %s
                 """
@@ -269,12 +442,14 @@ class PostgresStateManager(object):
                 "org_id": row[1],
                 "user_id": row[2],
                 "ticker": row[3],
-                "accession_number": row[4],
-                "notification_type": row[5],
-                "title": row[6],
-                "body": row[7],
-                "is_read": bool(row[8]),
-                "created_at": row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+                "market": row[4] or "US_SEC",
+                "exchange": row[5] or "",
+                "accession_number": row[6],
+                "notification_type": row[7],
+                "title": row[8],
+                "body": row[9],
+                "is_read": bool(row[10]),
+                "created_at": row[11].isoformat() if hasattr(row[11], "isoformat") else str(row[11]),
             }
             for row in rows
         ]
@@ -361,7 +536,8 @@ class PostgresStateManager(object):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT accession_number, ticker, filing_url, status, updated_at
+                    SELECT accession_number, ticker, filing_url, status, updated_at,
+                           dead_letter_reason, last_error, replay_count, last_replay_at
                     FROM filings
                     WHERE status IN ('DEAD_LETTER', 'ANALYZED_NOT_INDEXED')
                     ORDER BY updated_at DESC
@@ -379,6 +555,10 @@ class PostgresStateManager(object):
                 "filing_url": row[2],
                 "status": row[3],
                 "updated_at": row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
+                "dead_letter_reason": row[5] or "",
+                "last_error": row[6] or "",
+                "replay_count": int(row[7] or 0),
+                "last_replay_at": row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8] or ""),
             }
             for row in rows
         ]
@@ -388,7 +568,8 @@ class PostgresStateManager(object):
         conn = self._conn()
         try:
             query = """
-                SELECT accession_number, ticker, filing_url, status, filing_type, item_code, filing_date, updated_at
+                SELECT accession_number, ticker, filing_url, status, market, exchange, issuer_id, source, source_event_id,
+                       document_type, currency, filing_type, item_code, filing_date, updated_at
                 FROM filings
                 WHERE status = 'ANALYZED'
             """
@@ -409,10 +590,17 @@ class PostgresStateManager(object):
                 "ticker": row[1],
                 "filing_url": row[2],
                 "status": row[3],
-                "filing_type": row[4] or "",
-                "item_code": row[5] or "",
-                "filing_date": row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6] or ""),
-                "updated_at": row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7]),
+                "market": row[4] or "US_SEC",
+                "exchange": row[5] or "",
+                "issuer_id": row[6] or "",
+                "source": row[7] or "",
+                "source_event_id": row[8] or "",
+                "document_type": row[9] or "",
+                "currency": row[10] or "",
+                "filing_type": row[11] or "",
+                "item_code": row[12] or "",
+                "filing_date": row[13].isoformat() if hasattr(row[13], "isoformat") else str(row[13] or ""),
+                "updated_at": row[14].isoformat() if hasattr(row[14], "isoformat") else str(row[14]),
             }
             for row in rows
         ]
@@ -521,6 +709,8 @@ class PostgresStateManager(object):
         coverage_brief,
         answer_markdown,
         citations,
+        confidence=0.0,
+        derivation_trace=None,
         latency_ms=0,
     ):
         conn = self._conn()
@@ -530,8 +720,8 @@ class PostgresStateManager(object):
                     """
                     INSERT INTO ask_template_runs(
                         org_id, user_id, template_id, ticker, rendered_question, relevance_label,
-                        coverage_brief, answer_markdown, citations_json, latency_ms
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                        coverage_brief, answer_markdown, citations_json, confidence, derivation_trace_json, latency_ms
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s)
                     RETURNING id
                     """,
                     (
@@ -544,6 +734,8 @@ class PostgresStateManager(object):
                         coverage_brief,
                         answer_markdown,
                         json.dumps(citations or [], ensure_ascii=True),
+                        float(confidence or 0.0),
+                        json.dumps(derivation_trace or [], ensure_ascii=True),
                         int(latency_ms),
                     ),
                 )
@@ -561,7 +753,8 @@ class PostgresStateManager(object):
                 cur.execute(
                     """
                     SELECT r.id, r.template_id, t.title, r.ticker, r.rendered_question, r.relevance_label,
-                           r.coverage_brief, r.answer_markdown, r.citations_json::text, r.latency_ms, r.created_at
+                           r.coverage_brief, r.answer_markdown, r.citations_json::text, r.confidence, r.derivation_trace_json::text,
+                           r.latency_ms, r.created_at
                     FROM ask_template_runs r
                     JOIN ask_templates t ON t.id = r.template_id
                     WHERE r.org_id = %s AND r.user_id = %s
@@ -579,6 +772,10 @@ class PostgresStateManager(object):
                 citations = json.loads(row[8] or "[]")
             except Exception:
                 citations = []
+            try:
+                derivation_trace = json.loads(row[10] or "[]")
+            except Exception:
+                derivation_trace = []
             results.append(
                 {
                     "id": row[0],
@@ -590,8 +787,10 @@ class PostgresStateManager(object):
                     "coverage_brief": row[6],
                     "answer_markdown": row[7],
                     "citations": citations,
-                    "latency_ms": row[9],
-                    "created_at": row[10].isoformat() if hasattr(row[10], "isoformat") else str(row[10]),
+                    "confidence": float(row[9] or 0.0),
+                    "derivation_trace": derivation_trace,
+                    "latency_ms": row[11],
+                    "created_at": row[12].isoformat() if hasattr(row[12], "isoformat") else str(row[12]),
                 }
             )
         return results

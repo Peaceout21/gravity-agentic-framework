@@ -117,6 +117,8 @@ def run_template_query(state_manager, graph_runtime, org_id, user_id, template, 
         coverage_brief=coverage_brief,
         answer_markdown=answer.answer_markdown,
         citations=answer.citations,
+        confidence=float(getattr(answer, "confidence", 0.0) or 0.0),
+        derivation_trace=list(getattr(answer, "derivation_trace", []) or []),
         latency_ms=latency_ms,
     )
     if hasattr(state_manager, "log_event"):
@@ -141,6 +143,8 @@ def run_template_query(state_manager, graph_runtime, org_id, user_id, template, 
         "coverage_brief": coverage_brief,
         "answer_markdown": answer.answer_markdown,
         "citations": answer.citations,
+        "confidence": float(getattr(answer, "confidence", 0.0) or 0.0),
+        "derivation_trace": list(getattr(answer, "derivation_trace", []) or []),
         "latency_ms": latency_ms,
     }
 

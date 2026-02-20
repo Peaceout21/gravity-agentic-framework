@@ -36,6 +36,11 @@ class AgentMessage(BaseModel):
 
 
 class FilingPayload(BaseModel):
+    market: str = "US_SEC"
+    exchange: str = ""
+    issuer_id: str = ""
+    source: str = ""
+    source_event_id: str = ""
     ticker: str
     accession_number: str
     filing_url: str
@@ -61,6 +66,8 @@ class MarkdownAnswer(BaseModel):
     question: str
     answer_markdown: str
     citations: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    derivation_trace: List[str] = Field(default_factory=list)
     generated_at: datetime = Field(default_factory=datetime.utcnow)
 
 

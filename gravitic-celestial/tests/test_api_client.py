@@ -63,6 +63,14 @@ class GravityApiClientTests(unittest.TestCase):
         self.assertTrue(call_args[1]["json"]["include_existing"])
         self.assertTrue(call_args[1]["json"]["notify"])
 
+    def test_backfill_market_payload(self):
+        client = self._make_client()
+        client._session.post.return_value = self._mock_response({"mode": "async", "job_id": "b-2"})
+        _ = client.backfill_market(["INFY"], market="IN_NSE", exchange="NSE", per_ticker_limit=5)
+        body = client._session.post.call_args[1]["json"]
+        self.assertEqual(body["market"], "IN_NSE")
+        self.assertEqual(body["exchange"], "NSE")
+
     def test_query(self):
         client = self._make_client()
         client._session.post.return_value = self._mock_response(
@@ -96,6 +104,19 @@ class GravityApiClientTests(unittest.TestCase):
         remove_result = client.remove_watchlist(["MSFT"], user_id="u1")
         self.assertEqual(remove_result["status"], "ok")
         self.assertEqual(client._session.get.call_args[1]["headers"]["X-Org-Id"], "org-1")
+
+    def test_watchlist_market_methods(self):
+        client = self._make_client()
+        client._session.post.return_value = self._mock_response({"status": "ok"})
+        _ = client.add_watchlist_market(["INFY"], market="IN_NSE", exchange="NSE")
+        post_body = client._session.post.call_args[1]["json"]
+        self.assertEqual(post_body["market"], "IN_NSE")
+        self.assertEqual(post_body["exchange"], "NSE")
+
+        client._session.request.return_value = self._mock_response({"status": "ok"})
+        _ = client.remove_watchlist_market(["INFY"], market="IN_NSE", exchange="NSE")
+        delete_body = client._session.request.call_args[1]["json"]
+        self.assertEqual(delete_body["market"], "IN_NSE")
 
     def test_notification_methods(self):
         client = self._make_client()
@@ -143,6 +164,27 @@ class GravityApiClientTests(unittest.TestCase):
         client._session.get.return_value = self._mock_response([])
         _ = client.list_template_runs(limit=5)
         self.assertEqual(client._session.get.call_args[1]["params"]["limit"], 5)
+
+    def test_markets_and_resolve(self):
+        client = self._make_client()
+        client._session.get.return_value = self._mock_response({"markets": ["US_SEC", "IN_NSE"]})
+        markets = client.list_markets()
+        self.assertIn("IN_NSE", markets)
+
+        client._session.get.return_value = self._mock_response({"ticker": "INFY", "issuer_id": "INE009A01021"})
+        resolved = client.resolve_instrument("infy", market="IN_NSE")
+        self.assertEqual(resolved["ticker"], "INFY")
+
+    def test_replay_filing(self):
+        client = self._make_client()
+        client._session.post.return_value = self._mock_response(
+            {"status": "ok", "accession_number": "A1", "mode": "analysis", "analyzed": True, "indexed": True}
+        )
+        result = client.replay_filing("A1", mode="analysis")
+        self.assertEqual(result["status"], "ok")
+        body = client._session.post.call_args[1]["json"]
+        self.assertEqual(body["accession_number"], "A1")
+        self.assertEqual(body["mode"], "analysis")
 
 
 if __name__ == "__main__":

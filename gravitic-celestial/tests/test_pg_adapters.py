@@ -164,11 +164,14 @@ class PostgresStateManagerTests(unittest.TestCase):
             coverage_brief="Based on analyzed filings: 10-Q (2026-01-01).",
             answer_markdown="Answer",
             citations=["chunk-1"],
+            confidence=0.81,
+            derivation_trace=["Found metric in filing context"],
             latency_ms=100,
         )
         self.assertGreater(run_id, 0)
         runs = sm.list_ask_template_runs(org_id, user_id, limit=5)
         self.assertEqual(len(runs), 1)
+        self.assertGreaterEqual(runs[0].get("confidence", 0.0), 0.8)
 
 
 class PostgresCheckpointStoreTests(unittest.TestCase):
