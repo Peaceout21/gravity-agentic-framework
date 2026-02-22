@@ -4,10 +4,12 @@ from core.framework.messages import FilingPayload
 
 
 class IngestionNodes(object):
-    def __init__(self, edgar_client, state_manager, tickers):
+    def __init__(self, edgar_client, state_manager, tickers, market="US_SEC", exchange=""):
         self.edgar_client = edgar_client
         self.state_manager = state_manager
         self.tickers = tickers
+        self.market = (market or "US_SEC").upper()
+        self.exchange = exchange or ""
 
     @staticmethod
     def _merge(state, updates):
@@ -16,17 +18,37 @@ class IngestionNodes(object):
         return merged
 
     def poll_edgar(self, state):
-        records = self.edgar_client.get_latest_filings(self.tickers)
+        if hasattr(self.edgar_client, "market_code") and self.edgar_client.market_code != self.market:
+            raise ValueError("Configured provider %s does not support market %s" % (self.edgar_client.market_code, self.market))
+
+        if hasattr(self.edgar_client, "get_latest_events"):
+            records = self.edgar_client.get_latest_events(self.tickers)
+        else:
+            records = self.edgar_client.get_latest_filings(self.tickers)
         queue = []
         for record in records:
             if self.state_manager.has_accession(record.accession_number):
                 continue
+            metadata = dict(getattr(record, "metadata", {}) or {})
+            metadata.setdefault("market", getattr(record, "market", self.market))
+            metadata.setdefault("exchange", getattr(record, "exchange", self.exchange))
+            metadata.setdefault("issuer_id", getattr(record, "issuer_id", ""))
+            metadata.setdefault("source", getattr(record, "source", ""))
+            metadata.setdefault("source_event_id", getattr(record, "source_event_id", record.accession_number))
+            metadata.setdefault("document_type", getattr(record, "document_type", ""))
+            metadata.setdefault("currency", getattr(record, "currency", ""))
             queue.append(
                 {
                     "ticker": record.ticker,
                     "accession_number": record.accession_number,
                     "filing_url": record.filing_url,
-                    "metadata": record.metadata,
+                    "filing_type": getattr(record, "filing_type", ""),
+                    "market": metadata.get("market", self.market),
+                    "exchange": metadata.get("exchange", self.exchange),
+                    "issuer_id": metadata.get("issuer_id", ""),
+                    "source": metadata.get("source", ""),
+                    "source_event_id": metadata.get("source_event_id", record.accession_number),
+                    "metadata": metadata,
                     "record": record,
                 }
             )
@@ -48,7 +70,10 @@ class IngestionNodes(object):
             return self._merge(state, {"current_filing": {}, "raw_text": "", "trace": state.get("trace", []) + ["fetch_full_text_empty"]})
 
         current = queue[0]
-        text = self.edgar_client.get_filing_text(current["record"])
+        if hasattr(self.edgar_client, "get_document_text"):
+            text = self.edgar_client.get_document_text(current["record"])
+        else:
+            text = self.edgar_client.get_filing_text(current["record"])
         current["raw_text"] = text or ""
         return self._merge(
             state,
@@ -73,8 +98,14 @@ class IngestionNodes(object):
         if not current:
             return self._merge(state, {"trace": state.get("trace", []) + ["fetch_exhibits_empty"]})
 
-        attachments = self.edgar_client.get_filing_attachments(current["record"])
-        exhibit_text = self.edgar_client.find_exhibit_991_text(attachments) or ""
+        if hasattr(self.edgar_client, "get_document_attachments"):
+            attachments = self.edgar_client.get_document_attachments(current["record"])
+        else:
+            attachments = self.edgar_client.get_filing_attachments(current["record"])
+        if hasattr(self.edgar_client, "find_primary_attachment_text"):
+            exhibit_text = self.edgar_client.find_primary_attachment_text(attachments) or ""
+        else:
+            exhibit_text = self.edgar_client.find_exhibit_991_text(attachments) or ""
         current["exhibit_text"] = exhibit_text
         return self._merge(state, {"current_filing": current, "trace": state.get("trace", []) + ["fetch_exhibits"]})
 
@@ -96,15 +127,44 @@ class IngestionNodes(object):
         if not current:
             return self._merge(state, {"trace": state.get("trace", []) + ["emit_payload_skipped"]})
 
+        # Refine metadata using raw text if available
+        refined_meta = current.get("metadata", {})
+        if hasattr(self.edgar_client, "refine_metadata") and current.get("raw_text"):
+            refined_meta = self.edgar_client.refine_metadata(current["raw_text"], refined_meta)
+        
         payload = FilingPayload(
+            market=current.get("market", self.market),
+            exchange=current.get("exchange", self.exchange),
+            issuer_id=current.get("issuer_id", ""),
+            source=current.get("source", ""),
+            source_event_id=current.get("source_event_id", current["accession_number"]),
             ticker=current["ticker"],
             accession_number=current["accession_number"],
             filing_url=current["filing_url"],
             raw_text=current.get("raw_text", ""),
-            metadata=current.get("metadata", {}),
+            metadata=refined_meta,
         )
         payloads.append(payload)
-        self.state_manager.mark_ingested(payload.accession_number, payload.ticker, payload.filing_url)
+        metadata = payload.metadata or {}
+        item_code = metadata.get("item_code") or metadata.get("items") or ""
+        if isinstance(item_code, list):
+            item_code = ",".join(str(value) for value in item_code)
+        filing_date = metadata.get("filing_date") or ""
+        self.state_manager.mark_ingested(
+            payload.accession_number,
+            payload.ticker,
+            payload.filing_url,
+            filing_type=current.get("filing_type") or metadata.get("filing_type") or metadata.get("form"),
+            item_code=str(item_code),
+            filing_date=str(filing_date),
+            market=payload.market,
+            exchange=payload.exchange,
+            issuer_id=payload.issuer_id,
+            source=payload.source,
+            source_event_id=payload.source_event_id,
+            document_type=metadata.get("document_type") or metadata.get("filing_type") or metadata.get("form") or "",
+            currency=metadata.get("currency") or "",
+        )
 
         if queue:
             queue = queue[1:]

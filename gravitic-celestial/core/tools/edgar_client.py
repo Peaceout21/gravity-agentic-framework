@@ -18,6 +18,13 @@ class FilingRecord(object):
     accession_number: str
     filing_url: str
     filing_type: str = "8-K"
+    market: str = "US_SEC"
+    exchange: str = "SEC"
+    issuer_id: str = ""
+    source: str = "sec"
+    source_event_id: str = ""
+    document_type: str = ""
+    currency: str = "USD"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -95,6 +102,9 @@ class EdgarClient(object):
                             filing_type=record["form"],
                             metadata={
                                 "cik": cik,
+                                "form": record["form"],
+                                "filing_type": record["form"],
+                                "item_code": record.get("items", ""),
                                 "filing_date": record.get("filingDate", ""),
                                 "primary_document": primary_doc,
                                 "directory_url": directory_url,
@@ -151,6 +161,9 @@ class EdgarClient(object):
                             filing_type=record["form"],
                             metadata={
                                 "cik": cik,
+                                "form": record["form"],
+                                "filing_type": record["form"],
+                                "item_code": record.get("items", ""),
                                 "filing_date": record.get("filingDate", ""),
                                 "primary_document": primary_doc,
                                 "directory_url": directory_url,
@@ -273,6 +286,7 @@ class EdgarClient(object):
         forms = recent.get("form", [])
         primary_docs = recent.get("primaryDocument", [])
         filing_dates = recent.get("filingDate", [])
+        items = recent.get("items", [])
 
         count = min(len(accessions), len(forms), len(primary_docs), len(filing_dates))
         rows = []
@@ -283,6 +297,7 @@ class EdgarClient(object):
                     "form": forms[idx],
                     "primaryDocument": primary_docs[idx],
                     "filingDate": filing_dates[idx],
+                    "items": items[idx] if idx < len(items) else "",
                 }
             )
         return rows
@@ -308,6 +323,25 @@ class EdgarClient(object):
         except Exception:
             logging.exception("SEC text request failed url=%s", url)
             return ""
+
+    def refine_metadata(self, raw_text, metadata):
+        # type: (str, Dict[str, Any]) -> Dict[str, Any]
+        refined = dict(metadata)
+        
+        # 1. Filing Date fallback (looking for "FILED AS OF DATE: YYYYMMDD" or similar)
+        if not refined.get("filing_date"):
+            date_match = re.search(r"FILED AS OF DATE:\s*(\d{8})", raw_text)
+            if date_match:
+                d = date_match.group(1)
+                refined["filing_date"] = "%s-%s-%s" % (d[:4], d[4:6], d[6:])
+        
+        # 2. Item Codes fallback (8-K items: "Item 2.02", "Item 7.01", etc.)
+        if not refined.get("item_code"):
+            items = sorted(list(set(re.findall(r"Item\s*(\d+\.\d+)", raw_text, re.IGNORECASE))))
+            if items:
+                refined["item_code"] = ",".join(items)
+                
+        return refined
 
 
 def html_to_text(raw_text):

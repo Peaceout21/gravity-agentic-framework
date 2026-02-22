@@ -4,6 +4,13 @@
 
 Implemented the full production architecture from `docs/ARCHITECTURE_500_1000_USERS.md`: three Docker Compose services (`gravity-api`, `gravity-workers`, `gravity-web`) backed by Postgres+pgvector and Redis, while preserving SQLite fallback for local development. All work lives on a dedicated feature branch.
 
+## Related Docs
+
+- `docs/ROLLOUT_MATRIX.md` - staged rollout gates, KPIs, and rollback criteria.
+- `docs/PROGRESS_LOG.txt` - chronological experiment history and decisions.
+- `docs/USER_JOURNEY.md` - layman-friendly product flow and user narrative.
+- `docs/CORE_PRODUCT_SPECS.md` - end-to-end product requirements and scope.
+
 ---
 
 ## Branch & Commits

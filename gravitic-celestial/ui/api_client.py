@@ -56,9 +56,13 @@ class GravityApiClient(object):
     # ------------------------------------------------------------------
     def ingest(self, tickers):
         # type: (List[str]) -> Dict[str, Any]
+        return self.ingest_market(tickers=tickers, market="US_SEC", exchange="")
+
+    def ingest_market(self, tickers, market="US_SEC", exchange=""):
+        # type: (List[str], str, str) -> Dict[str, Any]
         resp = self._session.post(
             "%s/ingest" % self.base_url,
-            json={"tickers": tickers},
+            json={"tickers": tickers, "market": (market or "US_SEC").upper(), "exchange": (exchange or "").upper()},
             headers=self._auth_headers(),
             timeout=120,
         )
@@ -67,13 +71,36 @@ class GravityApiClient(object):
 
     def backfill(self, tickers, per_ticker_limit=8, include_existing=False, notify=False):
         # type: (List[str], int, bool, bool) -> Dict[str, Any]
+        return self.backfill_market(
+            tickers=tickers,
+            market="US_SEC",
+            exchange="",
+            per_ticker_limit=per_ticker_limit,
+            include_existing=include_existing,
+            notify=notify,
+        )
+
+    def backfill_market(
+        self,
+        tickers,
+        market="US_SEC",
+        exchange="",
+        per_ticker_limit=8,
+        include_existing=False,
+        notify=False,
+        document_types=None,
+    ):
+        # type: (List[str], str, str, int, bool, bool, Optional[List[str]]) -> Dict[str, Any]
         resp = self._session.post(
             "%s/backfill" % self.base_url,
             json={
                 "tickers": tickers,
+                "market": (market or "US_SEC").upper(),
+                "exchange": (exchange or "").upper(),
                 "per_ticker_limit": per_ticker_limit,
                 "include_existing": include_existing,
                 "notify": notify,
+                "document_types": document_types or [],
             },
             headers=self._auth_headers(),
             timeout=600,
@@ -97,13 +124,58 @@ class GravityApiClient(object):
         resp.raise_for_status()
         return resp.json()
 
+    def list_ask_templates(self):
+        # type: () -> List[Dict[str, Any]]
+        resp = self._session.get(
+            "%s/ask/templates" % self.base_url,
+            headers=self._auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def run_ask_template(self, template_id, ticker=None, params=None):
+        # type: (int, Optional[str], Optional[Dict[str, Any]]) -> Dict[str, Any]
+        body = {"template_id": int(template_id)}
+        if ticker:
+            body["ticker"] = ticker.upper()
+        if params:
+            body["params"] = params
+        resp = self._session.post(
+            "%s/ask/template-run" % self.base_url,
+            json=body,
+            headers=self._auth_headers(),
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_template_runs(self, limit=20):
+        # type: (int) -> List[Dict[str, Any]]
+        resp = self._session.get(
+            "%s/ask/template-runs" % self.base_url,
+            params={"limit": limit},
+            headers=self._auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ------------------------------------------------------------------
     # Watchlist
     # ------------------------------------------------------------------
     def list_watchlist(self, user_id="default"):
         _ = user_id  # retained for compatibility; auth header controls user context
+        return self.list_watchlist_market()
+
+    def list_watchlist_market(self, market=None):
+        # type: (Optional[str]) -> List[Dict[str, Any]]
+        params = {}
+        if market:
+            params["market"] = market.upper()
         resp = self._session.get(
             "%s/watchlist" % self.base_url,
+            params=params,
             headers=self._auth_headers(),
             timeout=10,
         )
@@ -112,9 +184,13 @@ class GravityApiClient(object):
 
     def add_watchlist(self, tickers, user_id="default"):
         _ = user_id
+        return self.add_watchlist_market(tickers=tickers, market="US_SEC", exchange="")
+
+    def add_watchlist_market(self, tickers, market="US_SEC", exchange=""):
+        # type: (List[str], str, str) -> Dict[str, Any]
         resp = self._session.post(
             "%s/watchlist" % self.base_url,
-            json={"tickers": tickers},
+            json={"tickers": tickers, "market": (market or "US_SEC").upper(), "exchange": (exchange or "").upper()},
             headers=self._auth_headers(),
             timeout=10,
         )
@@ -123,11 +199,31 @@ class GravityApiClient(object):
 
     def remove_watchlist(self, tickers, user_id="default"):
         _ = user_id
+        return self.remove_watchlist_market(tickers=tickers, market="US_SEC", exchange="")
+
+    def remove_watchlist_market(self, tickers, market="US_SEC", exchange=""):
+        # type: (List[str], str, str) -> Dict[str, Any]
         resp = self._session.request(
             "DELETE",
             "%s/watchlist" % self.base_url,
-            json={"tickers": tickers},
+            json={"tickers": tickers, "market": (market or "US_SEC").upper(), "exchange": (exchange or "").upper()},
             headers=self._auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_markets(self):
+        # type: () -> List[str]
+        resp = self._session.get("%s/markets" % self.base_url, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("markets", [])
+
+    def resolve_instrument(self, ticker, market="US_SEC"):
+        # type: (str, str) -> Dict[str, Any]
+        resp = self._session.get(
+            "%s/instruments/resolve" % self.base_url,
+            params={"ticker": ticker.strip().upper(), "market": (market or "US_SEC").upper()},
             timeout=10,
         )
         resp.raise_for_status()
@@ -190,6 +286,39 @@ class GravityApiClient(object):
         )
         resp.raise_for_status()
         return resp.json().get("unread", 0)
+
+    def backfill_filing_metadata(self):
+        # type: () -> Dict[str, Any]
+        resp = self._session.post(
+            "%s/filings/backfill-metadata" % self.base_url,
+            json={},
+            headers=self._auth_headers(),
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def count_filings_for_ticker(self, ticker):
+        # type: (str) -> int
+        resp = self._session.get(
+            "%s/filings/ticker-count" % self.base_url,
+            params={"ticker": ticker.strip().upper()},
+            headers=self._auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("count", 0)
+
+    def replay_filing(self, accession_number, mode="auto"):
+        # type: (str, str) -> Dict[str, Any]
+        resp = self._session.post(
+            "%s/filings/replay" % self.base_url,
+            json={"accession_number": accession_number.strip(), "mode": (mode or "auto").strip().lower()},
+            headers=self._auth_headers(),
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     # ------------------------------------------------------------------
     # Ops

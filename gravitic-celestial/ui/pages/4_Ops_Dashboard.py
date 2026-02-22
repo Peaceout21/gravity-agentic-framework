@@ -8,7 +8,7 @@ inject_css()
 
 use_api, client, runtime, org_id, user_id = setup_auth_sidebar()
 
-# Ops dashboard does not require user auth context — it's system-wide
+# Ops dashboard shows system-wide data but still requires authenticated headers.
 
 # ---------------------------------------------------------------------------
 # Header
@@ -186,6 +186,35 @@ if failures:
     )
 else:
     st.success("No recent failures. Pipeline is healthy.")
+
+# ---------------------------------------------------------------------------
+# Maintenance Actions
+# ---------------------------------------------------------------------------
+st.markdown("### Maintenance")
+
+if st.button("Backfill filing metadata", help="Populate filing_type for old filings that are missing it (inferred from URL). Safe to run multiple times."):
+    with st.spinner("Backfilling metadata..."):
+        try:
+            if use_api:
+                result = client.backfill_filing_metadata()
+            else:
+                result = runtime.state_manager.backfill_filing_metadata()
+            updated = result.get("updated_count", 0)
+            skipped = result.get("skipped_count", 0)
+            total = result.get("total_scanned", 0)
+            samples = result.get("samples", [])
+            if total == 0:
+                st.info("No filings needed metadata backfill.")
+            elif updated > 0:
+                st.success("Scanned %d filings: %d updated, %d skipped (unrecognized URL pattern)." % (total, updated, skipped))
+                if samples:
+                    st.caption("Sample updated accessions: %s" % ", ".join(samples))
+            else:
+                st.warning("Scanned %d filings but none matched a known URL pattern. %d skipped." % (total, skipped))
+        except Exception as exc:
+            st.error("Backfill failed: %s" % exc)
+
+st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Auto-refresh

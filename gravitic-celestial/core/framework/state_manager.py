@@ -1,9 +1,92 @@
 """SQLite-backed ingestion and processing state."""
 
+import json
+import re
 import sqlite3
 import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Filing-type inference from EDGAR URLs
+# ---------------------------------------------------------------------------
+# Pass 1: canonical path segments — handles /10-Q/, /10-K/, /8-K/ etc.
+_CANONICAL_PATTERN = re.compile(
+    r"/(10-[QK](?:/A)?|8-K(?:/A)?|6-K|20-F|S-1|SD)[/\b]",
+    re.IGNORECASE,
+)
+
+# Pass 2: compact EDGAR tokens found in filenames / URL slugs.
+# Maps lowercase token → canonical form type.
+_COMPACT_TOKEN_MAP = {
+    "10q": "10-Q",
+    "10k": "10-K",
+    "10ka": "10-K/A",
+    "10qa": "10-Q/A",
+    "8k": "8-K",
+    "8ka": "8-K/A",
+    "6k": "6-K",
+    "20f": "20-F",
+    "s1": "S-1",
+    "def14a": "DEF 14A",
+    "defa14a": "DEFA14A",
+    "sc13d": "SC 13D",
+    "sc13g": "SC 13G",
+    "sd": "SD",
+}
+
+# Build a single pattern from the token map for fallback matching.
+_COMPACT_PATTERN = re.compile(
+    r"(?:^|[/\-_.])(%s)(?:[/\-_.]|$)" % "|".join(re.escape(k) for k in _COMPACT_TOKEN_MAP),
+    re.IGNORECASE,
+)
+
+
+def _infer_filing_type(url):
+    # type: (str) -> Optional[str]
+    """Try to extract the SEC form type from a URL using two heuristics."""
+    if not url:
+        return None
+    # Pass 1: canonical path segment
+    m = _CANONICAL_PATTERN.search(url)
+    if m:
+        return m.group(1).upper()
+    # Pass 2: compact token in filename / slug
+    m = _COMPACT_PATTERN.search(url)
+    if m:
+        token = m.group(1).lower()
+        return _COMPACT_TOKEN_MAP.get(token)
+    return None
+
+
+def _backfill_filing_metadata_impl(fetch_rows, update_row):
+    # type: (Any, Any) -> Dict[str, Any]
+    """Shared backfill logic used by both SQLite and Postgres state managers."""
+    rows = fetch_rows()
+    total = len(rows)
+    updated = 0
+    skipped = 0
+    samples = []  # type: List[str]
+
+    for accession, url in rows:
+        filing_type = _infer_filing_type(url)
+        if filing_type is None:
+            skipped += 1
+            continue
+        ok = update_row(accession, filing_type)
+        if ok:
+            updated += 1
+            if len(samples) < 5:
+                samples.append(accession)
+        else:
+            skipped += 1
+
+    return {
+        "updated_count": updated,
+        "skipped_count": skipped,
+        "total_scanned": total,
+        "samples": samples,
+    }
 
 
 class StateManager(object):
@@ -24,6 +107,20 @@ class StateManager(object):
                     ticker TEXT NOT NULL,
                     filing_url TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    dead_letter_reason TEXT,
+                    last_error TEXT,
+                    replay_count INTEGER NOT NULL DEFAULT 0,
+                    last_replay_at TEXT,
+                    market TEXT NOT NULL DEFAULT 'US_SEC',
+                    exchange TEXT,
+                    issuer_id TEXT,
+                    source TEXT,
+                    source_event_id TEXT,
+                    document_type TEXT,
+                    currency TEXT,
+                    filing_type TEXT,
+                    item_code TEXT,
+                    filing_date TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -67,8 +164,88 @@ class StateManager(object):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ask_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_id TEXT,
+                    template_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    question_template TEXT NOT NULL,
+                    requires_ticker INTEGER NOT NULL DEFAULT 1,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(org_id, template_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ask_template_filing_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    template_id INTEGER NOT NULL,
+                    filing_type TEXT NOT NULL,
+                    item_code TEXT NOT NULL DEFAULT '',
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(template_id, filing_type, item_code),
+                    FOREIGN KEY(template_id) REFERENCES ask_templates(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS query_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    ticker TEXT,
+                    question TEXT NOT NULL,
+                    answer_markdown TEXT NOT NULL,
+                    citations_json TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    derivation_trace_json TEXT NOT NULL DEFAULT '[]',
+                    relevance_label TEXT,
+                    coverage_brief TEXT,
+                    template_id INTEGER,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             self._ensure_column(conn, "watchlists", "org_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(conn, "notifications", "org_id", "TEXT NOT NULL DEFAULT 'default'")
+            self._ensure_column(conn, "filings", "filing_type", "TEXT")
+            self._ensure_column(conn, "filings", "item_code", "TEXT")
+            self._ensure_column(conn, "filings", "filing_date", "TEXT")
+            self._ensure_column(conn, "filings", "market", "TEXT NOT NULL DEFAULT 'US_SEC'")
+            self._ensure_column(conn, "filings", "dead_letter_reason", "TEXT")
+            self._ensure_column(conn, "filings", "last_error", "TEXT")
+            self._ensure_column(conn, "filings", "replay_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "filings", "last_replay_at", "TEXT")
+            self._ensure_column(conn, "filings", "exchange", "TEXT")
+            self._ensure_column(conn, "filings", "issuer_id", "TEXT")
+            self._ensure_column(conn, "filings", "source", "TEXT")
+            self._ensure_column(conn, "filings", "source_event_id", "TEXT")
+            self._ensure_column(conn, "filings", "document_type", "TEXT")
+            self._ensure_column(conn, "filings", "currency", "TEXT")
+            self._ensure_column(conn, "watchlists", "market", "TEXT NOT NULL DEFAULT 'US_SEC'")
+            self._ensure_column(conn, "watchlists", "exchange", "TEXT")
+            self._ensure_column(conn, "notifications", "market", "TEXT NOT NULL DEFAULT 'US_SEC'")
+            self._ensure_column(conn, "notifications", "exchange", "TEXT")
+            self._ensure_column(conn, "ask_template_runs", "confidence", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "ask_template_runs", "derivation_trace_json", "TEXT NOT NULL DEFAULT '[]'")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_filings_market_source_event ON filings(market, source_event_id) "
+                "WHERE source_event_id IS NOT NULL AND source_event_id <> ''"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_market_updated_at ON filings(market, updated_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_market_ticker ON filings(market, ticker)")
+            self._seed_default_ask_templates(conn)
             conn.commit()
 
     @staticmethod
@@ -86,32 +263,181 @@ class StateManager(object):
             )
             return cur.fetchone() is not None
 
-    def upsert_filing(self, accession_number, ticker, filing_url, status):
+    def upsert_filing(
+        self,
+        accession_number,
+        ticker,
+        filing_url,
+        status,
+        filing_type=None,
+        item_code=None,
+        filing_date=None,
+        market="US_SEC",
+        exchange="",
+        issuer_id="",
+        source="",
+        source_event_id="",
+        document_type="",
+        currency="",
+        dead_letter_reason=None,
+        last_error=None,
+    ):
         now = datetime.utcnow().isoformat()
         with self._lock:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO filings (accession_number, ticker, filing_url, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO filings (
+                        accession_number, ticker, filing_url, status,
+                        dead_letter_reason, last_error,
+                        market, exchange, issuer_id, source, source_event_id, document_type, currency,
+                        filing_type, item_code, filing_date, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(accession_number)
-                    DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at
+                    DO UPDATE SET
+                        status=excluded.status,
+                        dead_letter_reason=excluded.dead_letter_reason,
+                        last_error=excluded.last_error,
+                        market=COALESCE(excluded.market, filings.market),
+                        exchange=COALESCE(excluded.exchange, filings.exchange),
+                        issuer_id=COALESCE(excluded.issuer_id, filings.issuer_id),
+                        source=COALESCE(excluded.source, filings.source),
+                        source_event_id=COALESCE(excluded.source_event_id, filings.source_event_id),
+                        document_type=COALESCE(excluded.document_type, filings.document_type),
+                        currency=COALESCE(excluded.currency, filings.currency),
+                        filing_type=COALESCE(excluded.filing_type, filings.filing_type),
+                        item_code=COALESCE(excluded.item_code, filings.item_code),
+                        filing_date=COALESCE(excluded.filing_date, filings.filing_date),
+                        updated_at=excluded.updated_at
                     """,
-                    (accession_number, ticker, filing_url, status, now, now),
+                    (
+                        accession_number,
+                        ticker,
+                        filing_url,
+                        status,
+                        dead_letter_reason,
+                        last_error,
+                        (market or "US_SEC"),
+                        exchange or "",
+                        issuer_id or "",
+                        source or "",
+                        source_event_id or "",
+                        document_type or "",
+                        currency or "",
+                        filing_type,
+                        item_code,
+                        filing_date,
+                        now,
+                        now,
+                    ),
                 )
                 conn.commit()
 
-    def mark_ingested(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "INGESTED")
+    def mark_ingested(
+        self,
+        accession_number,
+        ticker,
+        filing_url,
+        filing_type=None,
+        item_code=None,
+        filing_date=None,
+        market="US_SEC",
+        exchange="",
+        issuer_id="",
+        source="",
+        source_event_id="",
+        document_type="",
+        currency="",
+    ):
+        self.upsert_filing(
+            accession_number,
+            ticker,
+            filing_url,
+            "INGESTED",
+            filing_type=filing_type,
+            item_code=item_code,
+            filing_date=filing_date,
+            market=market,
+            exchange=exchange,
+            issuer_id=issuer_id,
+            source=source,
+            source_event_id=source_event_id,
+            document_type=document_type,
+            currency=currency,
+        )
 
     def mark_analyzed(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "ANALYZED")
+        self.upsert_filing(accession_number, ticker, filing_url, "ANALYZED", dead_letter_reason=None, last_error=None)
 
     def mark_analyzed_not_indexed(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "ANALYZED_NOT_INDEXED")
+        self.upsert_filing(
+            accession_number, ticker, filing_url, "ANALYZED_NOT_INDEXED", dead_letter_reason=None, last_error=None
+        )
 
-    def mark_dead_letter(self, accession_number, ticker, filing_url):
-        self.upsert_filing(accession_number, ticker, filing_url, "DEAD_LETTER")
+    def mark_dead_letter(self, accession_number, ticker, filing_url, reason=None, error=None):
+        self.upsert_filing(
+            accession_number,
+            ticker,
+            filing_url,
+            "DEAD_LETTER",
+            dead_letter_reason=(reason or ""),
+            last_error=(error or ""),
+        )
+
+    def get_filing(self, accession_number):
+        # type: (str) -> Optional[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT accession_number, ticker, filing_url, status, dead_letter_reason, last_error, replay_count, last_replay_at,
+                       market, exchange, issuer_id, source, source_event_id, document_type, currency,
+                       filing_type, item_code, filing_date, created_at, updated_at
+                FROM filings
+                WHERE accession_number = ?
+                """,
+                (accession_number,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "accession_number": row[0],
+            "ticker": row[1],
+            "filing_url": row[2],
+            "status": row[3],
+            "dead_letter_reason": row[4] or "",
+            "last_error": row[5] or "",
+            "replay_count": int(row[6] or 0),
+            "last_replay_at": row[7] or "",
+            "market": row[8] or "US_SEC",
+            "exchange": row[9] or "",
+            "issuer_id": row[10] or "",
+            "source": row[11] or "",
+            "source_event_id": row[12] or "",
+            "document_type": row[13] or "",
+            "currency": row[14] or "",
+            "filing_type": row[15] or "",
+            "item_code": row[16] or "",
+            "filing_date": row[17] or "",
+            "created_at": row[18] or "",
+            "updated_at": row[19] or "",
+        }
+
+    def mark_replay_attempt(self, accession_number):
+        # type: (str) -> None
+        now = datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE filings
+                SET replay_count = COALESCE(replay_count, 0) + 1,
+                    last_replay_at = ?
+                WHERE accession_number = ?
+                """,
+                (now, accession_number),
+            )
+            conn.commit()
 
     def log_event(self, topic, source, payload_text=""):
         now = datetime.utcnow().isoformat()
@@ -126,7 +452,9 @@ class StateManager(object):
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT accession_number, ticker, filing_url, status, updated_at
+                SELECT accession_number, ticker, filing_url, status, dead_letter_reason, last_error, replay_count, last_replay_at,
+                       market, exchange, issuer_id, source, source_event_id,
+                       document_type, currency, filing_type, item_code, filing_date, updated_at
                 FROM filings
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -140,71 +468,121 @@ class StateManager(object):
                 "ticker": row[1],
                 "filing_url": row[2],
                 "status": row[3],
-                "updated_at": row[4],
+                "dead_letter_reason": row[4] or "",
+                "last_error": row[5] or "",
+                "replay_count": int(row[6] or 0),
+                "last_replay_at": row[7] or "",
+                "market": row[8] or "US_SEC",
+                "exchange": row[9] or "",
+                "issuer_id": row[10] or "",
+                "source": row[11] or "",
+                "source_event_id": row[12] or "",
+                "document_type": row[13] or "",
+                "currency": row[14] or "",
+                "filing_type": row[15] or "",
+                "item_code": row[16] or "",
+                "filing_date": row[17] or "",
+                "updated_at": row[18],
             }
             for row in rows
         ]
 
-    def add_watchlist_ticker(self, org_id, user_id, ticker):
+    def add_watchlist_ticker(self, org_id, user_id, ticker, market="US_SEC", exchange=""):
         now = datetime.utcnow().isoformat()
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO watchlists(org_id, user_id, ticker, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(org_id, user_id, ticker) DO NOTHING
+                INSERT INTO watchlists(org_id, user_id, ticker, market, exchange, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(org_id, user_id, ticker) DO UPDATE SET
+                    market=excluded.market,
+                    exchange=excluded.exchange
                 """,
-                (org_id, user_id, ticker.upper(), now),
+                (org_id, user_id, ticker.upper(), (market or "US_SEC").upper(), (exchange or "").upper(), now),
             )
             conn.commit()
 
-    def remove_watchlist_ticker(self, org_id, user_id, ticker):
+    def remove_watchlist_ticker(self, org_id, user_id, ticker, market=None, exchange=None):
+        query = "DELETE FROM watchlists WHERE org_id = ? AND user_id = ? AND ticker = ?"
+        params = [org_id, user_id, ticker.upper()]
+        if market:
+            query += " AND market = ?"
+            params.append(market.upper())
+        if exchange:
+            query += " AND exchange = ?"
+            params.append(exchange.upper())
         with self._connect() as conn:
-            conn.execute(
-                "DELETE FROM watchlists WHERE org_id = ? AND user_id = ? AND ticker = ?",
-                (org_id, user_id, ticker.upper()),
-            )
+            conn.execute(query, tuple(params))
             conn.commit()
 
-    def list_watchlist(self, org_id, user_id):
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT ticker, created_at
+    def list_watchlist(self, org_id, user_id, market=None):
+        query = """
+                SELECT ticker, market, exchange, created_at
                 FROM watchlists
                 WHERE org_id = ? AND user_id = ?
-                ORDER BY ticker ASC
-                """,
-                (org_id, user_id),
-            )
-            rows = cur.fetchall()
-        return [{"ticker": row[0], "created_at": row[1]} for row in rows]
-
-    def list_watchlist_subscribers(self, org_id, ticker):
+            """
+        params = [org_id, user_id]
+        if market:
+            query += " AND market = ?"
+            params.append(market.upper())
+        query += " ORDER BY ticker ASC"
         with self._connect() as conn:
-            cur = conn.execute(
-                "SELECT user_id FROM watchlists WHERE org_id = ? AND ticker = ?",
-                (org_id, ticker.upper()),
-            )
+            cur = conn.execute(query, tuple(params))
+            rows = cur.fetchall()
+        return [
+            {"ticker": row[0], "market": row[1] or "US_SEC", "exchange": row[2] or "", "created_at": row[3]}
+            for row in rows
+        ]
+
+    def list_watchlist_subscribers(self, org_id, ticker, market="US_SEC", exchange=None):
+        query = "SELECT user_id FROM watchlists WHERE org_id = ? AND ticker = ? AND market = ?"
+        params = [org_id, ticker.upper(), (market or "US_SEC").upper()]
+        if exchange:
+            query += " AND exchange = ?"
+            params.append(exchange.upper())
+        with self._connect() as conn:
+            cur = conn.execute(query, tuple(params))
             rows = cur.fetchall()
         return [row[0] for row in rows]
 
-    def create_notification(self, org_id, user_id, ticker, accession_number, notification_type, title, body):
+    def create_notification(
+        self,
+        org_id,
+        user_id,
+        ticker,
+        accession_number,
+        notification_type,
+        title,
+        body,
+        market="US_SEC",
+        exchange="",
+    ):
         now = datetime.utcnow().isoformat()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO notifications(
-                    org_id, user_id, ticker, accession_number, notification_type, title, body, is_read, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    org_id, user_id, ticker, market, exchange, accession_number, notification_type, title, body, is_read, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 """,
-                (org_id, user_id, ticker.upper(), accession_number, notification_type, title, body, now),
+                (
+                    org_id,
+                    user_id,
+                    ticker.upper(),
+                    (market or "US_SEC").upper(),
+                    (exchange or "").upper(),
+                    accession_number,
+                    notification_type,
+                    title,
+                    body,
+                    now,
+                ),
             )
             conn.commit()
 
     def list_notifications(self, org_id, user_id, limit=50, unread_only=False, ticker=None, notification_type=None):
         query = """
-            SELECT id, org_id, user_id, ticker, accession_number, notification_type, title, body, is_read, created_at
+            SELECT id, org_id, user_id, ticker, market, exchange, accession_number, notification_type, title, body, is_read, created_at
             FROM notifications
             WHERE org_id = ? AND user_id = ?
         """
@@ -229,12 +607,14 @@ class StateManager(object):
                 "org_id": row[1],
                 "user_id": row[2],
                 "ticker": row[3],
-                "accession_number": row[4],
-                "notification_type": row[5],
-                "title": row[6],
-                "body": row[7],
-                "is_read": bool(row[8]),
-                "created_at": row[9],
+                "market": row[4] or "US_SEC",
+                "exchange": row[5] or "",
+                "accession_number": row[6],
+                "notification_type": row[7],
+                "title": row[8],
+                "body": row[9],
+                "is_read": bool(row[10]),
+                "created_at": row[11],
             }
             for row in rows
         ]
@@ -303,6 +683,7 @@ class StateManager(object):
             cur = conn.execute(
                 """
                 SELECT accession_number, ticker, filing_url, status, updated_at
+                       , dead_letter_reason, last_error, replay_count, last_replay_at
                 FROM filings
                 WHERE status IN ('DEAD_LETTER', 'ANALYZED_NOT_INDEXED')
                 ORDER BY updated_at DESC
@@ -318,6 +699,400 @@ class StateManager(object):
                 "filing_url": row[2],
                 "status": row[3],
                 "updated_at": row[4],
+                "dead_letter_reason": row[5] or "",
+                "last_error": row[6] or "",
+                "replay_count": int(row[7] or 0),
+                "last_replay_at": row[8] or "",
             }
             for row in rows
         ]
+    def list_all_dead_letters(self):
+        # type: () -> List[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT accession_number, ticker, filing_url, status, updated_at
+                FROM filings
+                WHERE status = 'DEAD_LETTER'
+                """
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "accession_number": row[0],
+                "ticker": row[1],
+                "filing_url": row[2],
+                "status": row[3],
+                "updated_at": row[4],
+            }
+            for row in rows
+        ]
+
+    def list_recent_analyzed_filings(self, ticker=None, limit=8):
+        # type: (Optional[str], int) -> List[Dict[str, Any]]
+        query = """
+            SELECT accession_number, ticker, filing_url, status, market, exchange, issuer_id, source, source_event_id,
+                   document_type, currency, filing_type, item_code, filing_date, updated_at
+            FROM filings
+            WHERE status = 'ANALYZED'
+        """
+        params = []  # type: List[Any]
+        if ticker:
+            query += " AND ticker = ?"
+            params.append(ticker.upper())
+        query += " ORDER BY COALESCE(filing_date, updated_at) DESC, updated_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            cur = conn.execute(query, tuple(params))
+            rows = cur.fetchall()
+        return [
+            {
+                "accession_number": row[0],
+                "ticker": row[1],
+                "filing_url": row[2],
+                "status": row[3],
+                "market": row[4] or "US_SEC",
+                "exchange": row[5] or "",
+                "issuer_id": row[6] or "",
+                "source": row[7] or "",
+                "source_event_id": row[8] or "",
+                "document_type": row[9] or "",
+                "currency": row[10] or "",
+                "filing_type": row[11] or "",
+                "item_code": row[12] or "",
+                "filing_date": row[13] or "",
+                "updated_at": row[14],
+            }
+            for row in rows
+        ]
+
+    def list_ask_templates(self, org_id, user_id=None):
+        # type: (str, Optional[str]) -> List[Dict[str, Any]]
+        _ = user_id
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, org_id, template_key, title, description, category, question_template,
+                       requires_ticker, enabled, sort_order
+                FROM ask_templates
+                WHERE enabled = 1 AND (org_id = ? OR org_id IS NULL)
+                ORDER BY CASE WHEN org_id = ? THEN 0 ELSE 1 END, sort_order ASC, title ASC
+                """,
+                (org_id, org_id),
+            )
+            rows = cur.fetchall()
+        seen_keys = set()
+        templates = []
+        for row in rows:
+            key = row[2]
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            templates.append(
+                {
+                    "id": row[0],
+                    "org_id": row[1],
+                    "template_key": key,
+                    "title": row[3],
+                    "description": row[4],
+                    "category": row[5],
+                    "question_template": row[6],
+                    "requires_ticker": bool(row[7]),
+                    "enabled": bool(row[8]),
+                    "sort_order": row[9],
+                }
+            )
+        return templates
+
+    def get_ask_template(self, org_id, template_id):
+        # type: (str, int) -> Optional[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, org_id, template_key, title, description, category, question_template,
+                       requires_ticker, enabled, sort_order
+                FROM ask_templates
+                WHERE id = ? AND enabled = 1 AND (org_id = ? OR org_id IS NULL)
+                LIMIT 1
+                """,
+                (template_id, org_id),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "org_id": row[1],
+            "template_key": row[2],
+            "title": row[3],
+            "description": row[4],
+            "category": row[5],
+            "question_template": row[6],
+            "requires_ticker": bool(row[7]),
+            "enabled": bool(row[8]),
+            "sort_order": row[9],
+        }
+
+    def list_ask_template_rules(self, template_id):
+        # type: (int) -> List[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT filing_type, item_code, weight
+                FROM ask_template_filing_rules
+                WHERE template_id = ?
+                ORDER BY weight DESC, filing_type ASC
+                """,
+                (template_id,),
+            )
+            rows = cur.fetchall()
+        return [{"filing_type": row[0], "item_code": row[1] or "", "weight": float(row[2])} for row in rows]
+
+    def log_query(
+        self,
+        org_id,
+        user_id,
+        ticker,
+        question,
+        answer_markdown,
+        citations,
+        confidence=0.0,
+        derivation_trace=None,
+        relevance_label=None,
+        coverage_brief=None,
+        template_id=None,
+        latency_ms=0,
+    ):
+        now = datetime.utcnow().isoformat()
+        citations_json = json.dumps(citations or [], ensure_ascii=True)
+        derivation_trace_json = json.dumps(derivation_trace or [], ensure_ascii=True)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO query_history(
+                    org_id, user_id, ticker, question, answer_markdown, citations_json,
+                    confidence, derivation_trace_json, relevance_label, coverage_brief,
+                    template_id, latency_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    org_id,
+                    user_id,
+                    ticker.upper() if ticker else None,
+                    question,
+                    answer_markdown,
+                    citations_json,
+                    float(confidence or 0.0),
+                    derivation_trace_json,
+                    relevance_label,
+                    coverage_brief,
+                    template_id,
+                    int(latency_ms),
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def create_ask_template_run(
+        self,
+        org_id,
+        user_id,
+        template_id,
+        ticker,
+        rendered_question,
+        relevance_label,
+        coverage_brief,
+        answer_markdown,
+        citations,
+        confidence=0.0,
+        derivation_trace=None,
+        latency_ms=0,
+    ):
+        return self.log_query(
+            org_id=org_id,
+            user_id=user_id,
+            ticker=ticker,
+            question=rendered_question,
+            answer_markdown=answer_markdown,
+            citations=citations,
+            confidence=confidence,
+            derivation_trace=derivation_trace,
+            relevance_label=relevance_label,
+            coverage_brief=coverage_brief,
+            template_id=template_id,
+            latency_ms=latency_ms,
+        )
+
+    def list_query_history(self, org_id, user_id, limit=20):
+        # type: (str, str, int) -> List[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT h.id, h.template_id, t.title, h.ticker, h.question, h.relevance_label,
+                       h.coverage_brief, h.answer_markdown, h.citations_json, h.confidence,
+                       h.derivation_trace_json, h.latency_ms, h.created_at
+                FROM query_history h
+                LEFT JOIN ask_templates t ON t.id = h.template_id
+                WHERE h.org_id = ? AND h.user_id = ?
+                ORDER BY h.created_at DESC
+                LIMIT ?
+                """,
+                (org_id, user_id, limit),
+            )
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            try:
+                citations = json.loads(row[8] or "[]")
+            except Exception:
+                citations = []
+            try:
+                derivation_trace = json.loads(row[10] or "[]")
+            except Exception:
+                derivation_trace = []
+            results.append(
+                {
+                    "id": row[0],
+                    "template_id": row[1],
+                    "template_title": row[2] or "Freeform Q&A",
+                    "ticker": row[3] or "",
+                    "question": row[4],
+                    "relevance_label": row[5] or "",
+                    "coverage_brief": row[6] or "",
+                    "answer_markdown": row[7],
+                    "citations": citations,
+                    "confidence": float(row[9] or 0.0),
+                    "derivation_trace": derivation_trace,
+                    "latency_ms": row[11],
+                    "created_at": row[12],
+                }
+            )
+        return results
+
+    def list_ask_template_runs(self, org_id, user_id, limit=20):
+        return self.list_query_history(org_id, user_id, limit)
+
+    def count_filings_for_ticker(self, ticker):
+        # type: (str) -> int
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM filings WHERE ticker = ?",
+                (ticker.upper(),),
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+    def backfill_filing_metadata(self):
+        # type: () -> Dict[str, Any]
+        """Populate filing_type for rows where it is NULL/empty.
+
+        Uses two heuristics in order:
+        1. Canonical URL path segments (``/10-Q/``, ``/8-K/``, etc.)
+        2. Compact EDGAR tokens often found in filenames (``def14a``, ``sc13d``, ``20f``, etc.)
+
+        Returns a dict with ``updated_count``, ``skipped_count``, ``total_scanned``,
+        and ``samples`` (up to 5 updated accession numbers).
+        """
+        result = _backfill_filing_metadata_impl(
+            fetch_rows=lambda: self._fetch_empty_metadata_rows(),
+            update_row=lambda acc, ft: self._update_filing_type(acc, ft),
+        )
+        return result
+
+    def _fetch_empty_metadata_rows(self):
+        # type: () -> list
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT accession_number, filing_url FROM filings WHERE filing_type IS NULL OR filing_type = ''"
+            )
+            return cur.fetchall()
+
+    def _update_filing_type(self, accession, filing_type):
+        # type: (str, str) -> bool
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE filings SET filing_type = ? WHERE accession_number = ? AND (filing_type IS NULL OR filing_type = '')",
+                    (filing_type, accession),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+    def _seed_default_ask_templates(self, conn):
+        now = datetime.utcnow().isoformat()
+        defaults = [
+            {
+                "key": "qoq_changes",
+                "title": "Quarter-over-quarter changes",
+                "description": "Summarize what changed versus the previous quarter.",
+                "category": "overview",
+                "question_template": "What changed versus the previous quarter for {ticker}?",
+                "requires_ticker": 1,
+                "sort_order": 10,
+                "rules": [("10-Q", None, 1.0), ("10-K", None, 0.9), ("8-K", "2.02", 0.6)],
+            },
+            {
+                "key": "kpi_surprises",
+                "title": "Top KPI surprises",
+                "description": "Highlight top KPI surprises from the latest filing.",
+                "category": "kpi",
+                "question_template": "What are the top KPI surprises in the latest filing for {ticker}?",
+                "requires_ticker": 1,
+                "sort_order": 20,
+                "rules": [("10-Q", None, 1.0), ("10-K", None, 0.9), ("8-K", "2.02", 0.7)],
+            },
+            {
+                "key": "guidance_shift",
+                "title": "Guidance shifts",
+                "description": "Find changes in management guidance and implications.",
+                "category": "guidance",
+                "question_template": "What guidance changes were disclosed for {ticker}, and what do they imply?",
+                "requires_ticker": 1,
+                "sort_order": 30,
+                "rules": [("10-Q", None, 0.9), ("10-K", None, 0.8), ("8-K", "2.02", 1.0)],
+            },
+            {
+                "key": "risk_flags",
+                "title": "Key risk flags",
+                "description": "Surface notable risks from latest disclosures.",
+                "category": "risk",
+                "question_template": "What key risks were flagged in the latest filing for {ticker}?",
+                "requires_ticker": 1,
+                "sort_order": 40,
+                "rules": [("10-K", None, 1.0), ("10-Q", None, 0.8), ("8-K", None, 0.4)],
+            },
+        ]
+        for template in defaults:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO ask_templates(
+                    org_id, template_key, title, description, category, question_template,
+                    requires_ticker, enabled, sort_order, created_at, updated_at
+                ) VALUES (NULL, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    template["key"],
+                    template["title"],
+                    template["description"],
+                    template["category"],
+                    template["question_template"],
+                    template["requires_ticker"],
+                    template["sort_order"],
+                    now,
+                    now,
+                ),
+            )
+            cur = conn.execute("SELECT id FROM ask_templates WHERE org_id IS NULL AND template_key = ?", (template["key"],))
+            row = cur.fetchone()
+            if not row:
+                continue
+            template_id = int(row[0])
+            for filing_type, item_code, weight in template["rules"]:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO ask_template_filing_rules(template_id, filing_type, item_code, weight, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (template_id, filing_type, item_code or "", weight, now),
+                )

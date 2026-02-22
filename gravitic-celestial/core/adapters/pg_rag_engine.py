@@ -115,22 +115,34 @@ class PostgresRAGEngine(object):
     # ------------------------------------------------------------------
     # Semantic search (pgvector cosine similarity)
     # ------------------------------------------------------------------
-    def semantic_search(self, query, top_k=8):
-        # type: (str, int) -> List[SearchResult]
+    def semantic_search(self, query, top_k=8, ticker=None):
+        # type: (str, int, Optional[str]) -> List[SearchResult]
         emb = _embed_texts([query])[0]
         emb_str = "[%s]" % ",".join(str(v) for v in emb)
+        
+        where_clause = "WHERE embedding IS NOT NULL"
+        if ticker:
+            where_clause += " AND metadata_json->>'ticker' = %s"
+            
+        sql = f"""
+            SELECT id, text, metadata_json,
+                   1 - (embedding <=> %s::vector) AS score
+            FROM chunks
+            {where_clause}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """
+        
+        # Build params list in the correct order for the query above
+        final_params = []
+        final_params.append(emb_str) # for score
+        if ticker:
+            final_params.append(ticker.upper()) # for where clause
+        final_params.append(emb_str) # for order by
+        final_params.append(top_k) # for limit
+        
         with self._conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, text, metadata_json,
-                       1 - (embedding <=> %s::vector) AS score
-                FROM chunks
-                WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (emb_str, emb_str, top_k),
-            )
+            cur.execute(sql, tuple(final_params))
             rows = cur.fetchall()
         results = []
         for row in rows:
@@ -143,13 +155,14 @@ class PostgresRAGEngine(object):
     # ------------------------------------------------------------------
     # Keyword search (BM25)
     # ------------------------------------------------------------------
-    def keyword_search(self, query, top_k=8):
-        # type: (str, int) -> List[SearchResult]
+    def keyword_search(self, query, top_k=8, ticker=None):
+        # type: (str, int, Optional[str]) -> List[SearchResult]
         q_tokens = tokenize(query)
         if not q_tokens:
             return []
 
-        if self._bm25 is not None:
+        if self._bm25 is not None and not ticker:
+            # Global BM25 index
             scores = self._bm25.get_scores(q_tokens)
             ranked = sorted(
                 enumerate(scores),
@@ -164,9 +177,15 @@ class PostgresRAGEngine(object):
                     output.append(result)
             return output
 
-        # Fallback lexical scoring
+        # Fallback lexical scoring or ticker-filtered scoring
         with self._conn.cursor() as cur:
-            cur.execute("SELECT id, text, metadata_json FROM chunks")
+            if ticker:
+                cur.execute(
+                    "SELECT id, text, metadata_json FROM chunks WHERE metadata_json->>'ticker' = %s",
+                    (ticker.upper(),),
+                )
+            else:
+                cur.execute("SELECT id, text, metadata_json FROM chunks")
             rows = cur.fetchall()
         output = []
         q_set = set(q_tokens)
@@ -211,8 +230,8 @@ class PostgresRAGEngine(object):
     # ------------------------------------------------------------------
     # Full hybrid query
     # ------------------------------------------------------------------
-    def query(self, query_text, top_k=8):
-        # type: (str, int) -> List[SearchResult]
-        semantic = self.semantic_search(query_text, top_k=top_k)
-        keyword = self.keyword_search(query_text, top_k=top_k)
+    def query(self, query_text, top_k=8, ticker=None):
+        # type: (str, int, Optional[str]) -> List[SearchResult]
+        semantic = self.semantic_search(query_text, top_k=top_k, ticker=ticker)
+        keyword = self.keyword_search(query_text, top_k=top_k, ticker=ticker)
         return self.reciprocal_rank_fusion(semantic, keyword, top_k=top_k)

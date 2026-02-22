@@ -39,9 +39,20 @@ class ApiEndpointTests(unittest.TestCase):
                 "ticker": "MSFT",
                 "filing_url": "http://sec.gov/test",
                 "status": "ANALYZED",
+                "dead_letter_reason": "",
+                "last_error": "",
+                "replay_count": 0,
+                "last_replay_at": "",
                 "updated_at": "2025-01-01T00:00:00",
             }
         ]
+        state_manager.get_filing.return_value = {
+            "accession_number": "0001-23-000001",
+            "ticker": "MSFT",
+            "filing_url": "http://sec.gov/test",
+            "status": "DEAD_LETTER",
+            "market": "US_SEC",
+        }
         state_manager.list_watchlist.return_value = [{"ticker": "MSFT", "created_at": "2025-01-01T00:00:00"}]
         state_manager.list_notifications.return_value = [
             {
@@ -58,21 +69,76 @@ class ApiEndpointTests(unittest.TestCase):
             }
         ]
         state_manager.mark_notification_read.return_value = True
+        state_manager.list_ask_templates.return_value = [
+            {
+                "id": 1,
+                "template_key": "qoq_changes",
+                "title": "Quarter-over-quarter changes",
+                "description": "Summarize quarter changes",
+                "category": "overview",
+                "question_template": "What changed for {ticker}?",
+                "requires_ticker": True,
+                "enabled": True,
+                "sort_order": 10,
+            }
+        ]
+        state_manager.get_ask_template.return_value = {
+            "id": 1,
+            "template_key": "qoq_changes",
+            "title": "Quarter-over-quarter changes",
+            "description": "Summarize quarter changes",
+            "category": "overview",
+            "question_template": "What changed for {ticker}?",
+            "requires_ticker": True,
+            "enabled": True,
+            "sort_order": 10,
+        }
+        state_manager.list_recent_analyzed_filings.return_value = [
+            {
+                "accession_number": "A1",
+                "ticker": "MSFT",
+                "filing_type": "10-Q",
+                "item_code": "",
+                "filing_date": "2026-01-01",
+                "updated_at": "2026-01-01T00:00:00",
+                "status": "ANALYZED",
+                "filing_url": "http://sec.gov/a1",
+            }
+        ]
+        state_manager.list_ask_template_rules.return_value = [{"filing_type": "10-Q", "item_code": "", "weight": 1.0}]
+        state_manager.create_ask_template_run.return_value = 1001
+        state_manager.list_ask_template_runs.return_value = []
 
         graph_runtime = MagicMock()
         graph_runtime.run_ingestion_cycle.return_value = []
+        provider = MagicMock()
+        provider.market_code = "US_SEC"
+        provider.resolve_instrument.return_value = {"ticker": "MSFT", "issuer_id": "0000789019", "exchange": "SEC"}
+        graph_runtime.ingestion_nodes.edgar_client = provider
 
         answer_mock = MagicMock()
         answer_mock.question = "test?"
         answer_mock.answer_markdown = "Test answer."
         answer_mock.citations = ["chunk-1"]
+        answer_mock.confidence = 0.74
+        answer_mock.derivation_trace = ["Used latest filing summary"]
         graph_runtime.answer_question.return_value = answer_mock
+        graph_runtime.replay_filing.return_value = {
+            "status": "ok",
+            "accession_number": "0001-23-000001",
+            "mode": "analysis",
+            "analyzed": True,
+            "indexed": True,
+        }
 
         return {
             "state_manager": state_manager,
             "rag_engine": MagicMock(),
             "job_queue": None,
             "graph_runtime": graph_runtime,
+            "supported_markets": ["US_SEC"],
+            "provider_factory": MagicMock(),
+            "sec_identity": "Unknown unknown@example.com",
         }
 
     def test_health_ok(self):
@@ -99,12 +165,48 @@ class ApiEndpointTests(unittest.TestCase):
     def test_filings_returns_list(self):
         mocks = self._default_mocks()
         client = self._make_client(mocks)
-        resp = client.get("/filings")
+        resp = client.get("/filings", headers=self._auth_headers())
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertIsInstance(data, list)
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["ticker"], "MSFT")
+
+    def test_filings_scoped_to_watchlist(self):
+        mocks = self._default_mocks()
+        mocks["state_manager"].list_recent_filings.return_value = [
+            {
+                "accession_number": "A1",
+                "ticker": "AAPL",
+                "filing_url": "http://sec.gov/a",
+                "status": "ANALYZED",
+                "dead_letter_reason": "",
+                "last_error": "",
+                "replay_count": 0,
+                "last_replay_at": "",
+                "updated_at": "2025-01-01T00:00:00",
+            }
+        ]
+        client = self._make_client(mocks)
+        resp = client.get("/filings", headers=self._auth_headers())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), [])
+
+    def test_markets_returns_supported_list(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.get("/markets")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["markets"], ["US_SEC"])
+
+    def test_resolve_instrument(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.get("/instruments/resolve", params={"ticker": "MSFT", "market": "US_SEC"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["ticker"], "MSFT")
+        self.assertEqual(body["issuer_id"], "0000789019")
 
     def test_ingest_sync_mode(self):
         mocks = self._default_mocks()
@@ -136,6 +238,13 @@ class ApiEndpointTests(unittest.TestCase):
         resp = client.post("/ingest", json={"tickers": []}, headers=self._auth_headers())
         self.assertEqual(resp.status_code, 400)
 
+    def test_ingest_rejects_unsupported_market(self):
+        mocks = self._default_mocks()
+        mocks["graph_runtime"].ingestion_nodes.edgar_client.market_code = "US_SEC"
+        client = self._make_client(mocks)
+        resp = client.post("/ingest", json={"tickers": ["MSFT"], "market": "IN_NSE"}, headers=self._auth_headers())
+        self.assertEqual(resp.status_code, 400)
+
     def test_query_returns_answer(self):
         mocks = self._default_mocks()
         client = self._make_client(mocks)
@@ -144,12 +253,56 @@ class ApiEndpointTests(unittest.TestCase):
         data = resp.json()
         self.assertEqual(data["answer_markdown"], "Test answer.")
         self.assertEqual(data["citations"], ["chunk-1"])
+        self.assertAlmostEqual(data["confidence"], 0.74, places=2)
+        self.assertEqual(data["derivation_trace"], ["Used latest filing summary"])
 
     def test_query_empty_question_returns_400(self):
         mocks = self._default_mocks()
         client = self._make_client(mocks)
         resp = client.post("/query", json={"question": "   "})
         self.assertEqual(resp.status_code, 400)
+
+    def test_replay_filing_success(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/filings/replay",
+            json={"accession_number": "0001-23-000001", "mode": "analysis"},
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["accession_number"], "0001-23-000001")
+        mocks["graph_runtime"].replay_filing.assert_called_once_with("0001-23-000001", mode="analysis")
+
+    def test_replay_filing_not_found(self):
+        mocks = self._default_mocks()
+        mocks["state_manager"].get_filing.return_value = None
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/filings/replay",
+            json={"accession_number": "does-not-exist"},
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_replay_filing_forbidden_outside_watchlist(self):
+        mocks = self._default_mocks()
+        mocks["state_manager"].get_filing.return_value = {
+            "accession_number": "0001-23-000001",
+            "ticker": "AAPL",
+            "filing_url": "http://sec.gov/test",
+            "status": "DEAD_LETTER",
+            "market": "US_SEC",
+        }
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/filings/replay",
+            json={"accession_number": "0001-23-000001", "mode": "analysis"},
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(resp.status_code, 403)
 
     def test_watchlist_add_and_list(self):
         mocks = self._default_mocks()
@@ -160,12 +313,30 @@ class ApiEndpointTests(unittest.TestCase):
         self.assertEqual(list_resp.status_code, 200)
         data = list_resp.json()
         self.assertEqual(data[0]["ticker"], "MSFT")
+        self.assertEqual(data[0]["market"], "US_SEC")
 
     def test_watchlist_remove(self):
         mocks = self._default_mocks()
         client = self._make_client(mocks)
         resp = client.request("DELETE", "/watchlist", json={"tickers": ["MSFT"]}, headers=self._auth_headers())
         self.assertEqual(resp.status_code, 200)
+
+    def test_watchlist_add_for_market(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/watchlist",
+            json={"tickers": ["INFY"], "market": "IN_NSE", "exchange": "NSE"},
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(resp.status_code, 200)
+        mocks["state_manager"].add_watchlist_ticker.assert_called_once_with(
+            org_id="default-org",
+            user_id="default-user",
+            ticker="INFY",
+            market="IN_NSE",
+            exchange="NSE",
+        )
 
     def test_notifications_list_and_mark_read(self):
         mocks = self._default_mocks()
@@ -216,6 +387,17 @@ class ApiEndpointTests(unittest.TestCase):
             payload = run_backfill.call_args[0][2]
             self.assertEqual(payload["org_id"], "o3")
 
+    def test_backfill_rejects_unsupported_market(self):
+        mocks = self._default_mocks()
+        mocks["graph_runtime"].ingestion_nodes.edgar_client.market_code = "US_SEC"
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/backfill",
+            json={"tickers": ["MSFT"], "market": "IN_BSE"},
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(resp.status_code, 400)
+
     def test_auth_api_key_enforced(self):
         mocks = self._default_mocks()
         with patch.dict("os.environ", {"GRAVITY_API_KEY": "secret-key"}):
@@ -257,6 +439,19 @@ class ApiEndpointTests(unittest.TestCase):
         resp = client.get("/notifications/count", headers=self._auth_headers())
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["unread"], 12)
+
+    def test_ticker_count_scoped_to_watchlist(self):
+        mocks = self._default_mocks()
+        mocks["state_manager"].count_filings_for_ticker.return_value = 7
+        client = self._make_client(mocks)
+
+        resp_allowed = client.get("/filings/ticker-count", params={"ticker": "MSFT"}, headers=self._auth_headers())
+        self.assertEqual(resp_allowed.status_code, 200)
+        self.assertEqual(resp_allowed.json()["count"], 7)
+
+        resp_denied = client.get("/filings/ticker-count", params={"ticker": "AAPL"}, headers=self._auth_headers())
+        self.assertEqual(resp_denied.status_code, 200)
+        self.assertEqual(resp_denied.json()["count"], 0)
 
     def test_ops_health(self):
         mocks = self._default_mocks()
@@ -307,6 +502,39 @@ class ApiEndpointTests(unittest.TestCase):
             ticker="MSFT",
             notification_type="FILING_FOUND",
         )
+
+    def test_list_ask_templates(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.get("/ask/templates", headers=self._auth_headers(org_id="o1", user_id="u1"))
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.json()
+        self.assertEqual(rows[0]["template_key"], "qoq_changes")
+        mocks["state_manager"].list_ask_templates.assert_called_once_with(org_id="o1", user_id="u1")
+
+    def test_template_run_success(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/ask/template-run",
+            json={"template_id": 1, "ticker": "MSFT"},
+            headers=self._auth_headers(org_id="o1", user_id="u1"),
+        )
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.json()
+        self.assertEqual(payload["template_id"], 1)
+        self.assertEqual(payload["relevance_label"], "High relevance")
+        self.assertTrue(payload["answer_markdown"])
+
+    def test_template_run_requires_ticker(self):
+        mocks = self._default_mocks()
+        client = self._make_client(mocks)
+        resp = client.post(
+            "/ask/template-run",
+            json={"template_id": 1},
+            headers=self._auth_headers(),
+        )
+        self.assertEqual(resp.status_code, 400)
 
 
 if __name__ == "__main__":

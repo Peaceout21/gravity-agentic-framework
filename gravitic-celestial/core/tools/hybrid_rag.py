@@ -82,13 +82,20 @@ class HybridRAGEngine(object):
             return None
         return SearchResult(chunk_id=row[0], text=row[1], metadata=json.loads(row[2]), score=0.0)
 
-    def semantic_search(self, query, top_k=8):
+    def semantic_search(self, query, top_k=8, ticker=None):
         # Placeholder semantic scorer: token overlap with normalization.
         q_tokens = set(tokenize(query))
         if not q_tokens:
             return []
+        
         with self._connect() as conn:
-            rows = conn.execute("SELECT id, text, metadata_json FROM chunks").fetchall()
+            if ticker:
+                rows = conn.execute(
+                    "SELECT id, text, metadata_json FROM chunks WHERE json_extract(metadata_json, '$.ticker') = ?",
+                    (ticker.upper(),)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT id, text, metadata_json FROM chunks").fetchall()
 
         results = []
         for chunk_id, text, metadata_json in rows:
@@ -102,12 +109,13 @@ class HybridRAGEngine(object):
         results.sort(key=lambda item: item.score, reverse=True)
         return results[:top_k]
 
-    def keyword_search(self, query, top_k=8):
+    def keyword_search(self, query, top_k=8, ticker=None):
         q_tokens = tokenize(query)
         if not q_tokens:
             return []
 
-        if self._bm25 is not None:
+        if self._bm25 is not None and not ticker:
+            # If no ticker filter, use the global BM25 index for speed
             scores = self._bm25.get_scores(q_tokens)
             ranked = sorted(
                 enumerate(scores),
@@ -122,9 +130,15 @@ class HybridRAGEngine(object):
                     output.append(result)
             return output
 
-        # Fallback lexical scoring.
+        # Fallback lexical scoring or ticker-filtered scoring.
         with self._connect() as conn:
-            rows = conn.execute("SELECT id, text, metadata_json FROM chunks").fetchall()
+            if ticker:
+                rows = conn.execute(
+                    "SELECT id, text, metadata_json FROM chunks WHERE json_extract(metadata_json, '$.ticker') = ?",
+                    (ticker.upper(),)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT id, text, metadata_json FROM chunks").fetchall()
 
         output = []
         q_set = set(q_tokens)
@@ -170,9 +184,9 @@ class HybridRAGEngine(object):
             )
         return fused
 
-    def query(self, query_text, top_k=8):
-        semantic = self.semantic_search(query_text, top_k=top_k)
-        keyword = self.keyword_search(query_text, top_k=top_k)
+    def query(self, query_text, top_k=8, ticker=None):
+        semantic = self.semantic_search(query_text, top_k=top_k, ticker=ticker)
+        keyword = self.keyword_search(query_text, top_k=top_k, ticker=ticker)
         return self.reciprocal_rank_fusion(semantic, keyword, top_k=top_k)
 
 

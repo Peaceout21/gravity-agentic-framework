@@ -16,7 +16,9 @@ class NotificationsTests(unittest.TestCase):
             def __init__(self):
                 self.created = []
 
-            def list_watchlist_subscribers(self, org_id, ticker):
+            def list_watchlist_subscribers(self, org_id, ticker, market="US_SEC", exchange=None):
+                _ = market
+                _ = exchange
                 if org_id != "o1":
                     return []
                 return ["u1", "u2"] if ticker == "MSFT" else []

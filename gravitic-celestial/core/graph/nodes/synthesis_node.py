@@ -1,5 +1,9 @@
 """LangGraph nodes for user question synthesis workflow."""
 
+import re
+
+from core.tools.extraction_engine import safe_json_extract
+
 
 class SynthesisNodes(object):
     def __init__(self, rag_engine, synthesis_engine):
@@ -23,7 +27,8 @@ class SynthesisNodes(object):
         )
 
     def retrieve_semantic(self, state):
-        semantic = self.rag_engine.semantic_search(state.get("question", ""), top_k=8)
+        ticker = state.get("ticker")
+        semantic = self.rag_engine.semantic_search(state.get("question", ""), top_k=15, ticker=ticker)
         return self._merge(
             state,
             {
@@ -33,7 +38,8 @@ class SynthesisNodes(object):
         )
 
     def retrieve_keyword(self, state):
-        keyword = self.rag_engine.keyword_search(state.get("question", ""), top_k=8)
+        ticker = state.get("ticker")
+        keyword = self.rag_engine.keyword_search(state.get("question", ""), top_k=15, ticker=ticker)
         return self._merge(
             state,
             {
@@ -54,6 +60,63 @@ class SynthesisNodes(object):
             },
         )
 
+    def derive_metric(self, state):
+        question = state.get("question", "")
+        retrieval_results = state.get("retrieval_results", [])
+        contexts = [item["text"] for item in retrieval_results][:4]
+        if not question or not contexts:
+            return self._merge(
+                state,
+                {
+                    "derived_answer": "",
+                    "derivation_trace": [],
+                    "answer_confidence": 0.0,
+                    "trace": state.get("trace", []) + ["derive_metric_skipped"],
+                },
+            )
+
+        prompt = (
+            "Given the question and evidence snippets, derive the requested metric only if supported by evidence. "
+            "Return JSON with keys derived_answer (string), confidence (0 to 1), derivation_trace (array of short steps). "
+            "If unsupported, set derived_answer to empty string and confidence to 0.\n\n"
+            "Question:\n%s\n\nEvidence:\n%s"
+            % (question, "\n\n".join(contexts))
+        )
+        generator = getattr(self.synthesis_engine, "adapter", None)
+        generate_json = getattr(generator, "generate_json", None)
+        parsed = {}
+        if callable(generate_json):
+            parsed = generate_json(prompt) or {}
+        if not isinstance(parsed, dict) or not parsed:
+            # Fallback: attempt text response parsed as JSON.
+            generate_text = getattr(generator, "generate_text", None)
+            if callable(generate_text):
+                parsed = safe_json_extract(generate_text(prompt) or "")
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        derived_answer = str(parsed.get("derived_answer", "") or "").strip()
+        if derived_answer and _looks_like_non_answer(derived_answer):
+            derived_answer = ""
+        confidence = _clamp_confidence(parsed.get("confidence", 0.0))
+        raw_trace = parsed.get("derivation_trace", [])
+        if not isinstance(raw_trace, list):
+            raw_trace = []
+        derivation_trace = [str(item).strip() for item in raw_trace if str(item).strip()][:5]
+        if not derived_answer:
+            confidence = 0.0
+            derivation_trace = []
+
+        return self._merge(
+            state,
+            {
+                "derived_answer": derived_answer,
+                "derivation_trace": derivation_trace,
+                "answer_confidence": confidence,
+                "trace": state.get("trace", []) + ["derive_metric"],
+            },
+        )
+
     def synthesize_answer(self, state):
         retrieval_results = state.get("retrieval_results", [])
         contexts = [item["text"] for item in retrieval_results]
@@ -62,11 +125,40 @@ class SynthesisNodes(object):
             for item in retrieval_results
         ]
         answer = self.synthesis_engine.synthesize(state.get("question", ""), contexts)
+        derived_answer = (state.get("derived_answer") or "").strip()
+        derivation_trace = state.get("derivation_trace", []) or []
+        # Use _clamp_confidence to guard against None/NaN before checking threshold
+        confidence = _clamp_confidence(state.get("answer_confidence", 0.0))
+
+        if derived_answer:
+            answer = "%s\n\n### Derived Metric\n%s" % (answer, derived_answer)
+            if derivation_trace:
+                answer = "%s\n\n### Derivation Trace\n- %s" % (answer, "\n- ".join(derivation_trace))
+
+        # If the LLM returned a non-answer, fall back to a RAG-only summary from top contexts
+        if _looks_like_non_answer(answer or "") and contexts:
+            top_contexts = contexts[:3]
+            rag_lines = []
+            for i, ctx in enumerate(top_contexts, 1):
+                snippet = ctx[:400].replace("\n", " ").strip()
+                if snippet:
+                    rag_lines.append("**[%d]** %s" % (i, snippet))
+            if rag_lines:
+                answer = (
+                    "*Direct synthesis was inconclusive. Here are the most relevant excerpts from indexed filings:*\n\n"
+                    + "\n\n".join(rag_lines)
+                )
+                confidence = _heuristic_confidence(contexts, citations)
+
+        if confidence <= 0.0:
+            confidence = _heuristic_confidence(contexts, citations)
         return self._merge(
             state,
             {
                 "answer": answer,
                 "answer_citations": citations,
+                "derivation_trace": derivation_trace,
+                "answer_confidence": _clamp_confidence(confidence),
                 "trace": state.get("trace", []) + ["synthesize_answer"],
             },
         )
@@ -96,3 +188,42 @@ def deserialize_result(result):
         metadata=result.get("metadata", {}),
         score=float(result.get("score", 0.0)),
     )
+
+
+def _heuristic_confidence(contexts, citations):
+    # type: (list, list) -> float
+    if not contexts:
+        return 0.0
+    if citations and len(citations) >= 2:
+        return 0.8
+    if citations:
+        return 0.65
+    return 0.35
+
+
+def _clamp_confidence(value):
+    # type: (object) -> float
+    try:
+        score = float(value)
+    except Exception:
+        return 0.0
+    if score < 0:
+        return 0.0
+    if score > 1:
+        return 1.0
+    return round(score, 4)
+
+
+def _looks_like_non_answer(text):
+    # type: (str) -> bool
+    normalized = text.lower().strip()
+    if not normalized:
+        return True
+    patterns = [
+        r"insufficient context",
+        r"not enough information",
+        r"cannot determine",
+        r"no information",
+        r"unknown",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
