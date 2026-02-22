@@ -1,0 +1,78 @@
+# Gravity Agentic Framework — UI/UX Walkthrough
+
+## Full Feature Parity React Migration
+
+The original Streamlit app has been fully rebuilt as a modern, decoupled **Vite + React + TypeScript** application with a premium glassmorphism dark-mode design.
+
+---
+
+## Pages
+
+### Dashboard
+Live filing intelligence at a glance: 4 metric cards (Unread Alerts, Filings Tracked, SEA Markets, System Health) + a recent filings table with time-ago timestamps, status color coding, and SEA/US market badges.
+
+![Dashboard](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/dashboard_main_1771594845106.png)
+
+### Notifications
+Full notification center with filters (unread-only, ticker, type, page size), mark-as-read per item, and mark-all-read with ticker/type scope. Unread items highlighted with an accent left border and NEW badge.
+
+![Notifications](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/notifications_main_1771594947703.png)
+
+### Watchlist & Backfill
+Market selector, live watchlist display (checkable for multi-select removal), add tickers, remove selected, run ingestion cycle, and trigger historical backfill with per-ticker limit and notification toggle.
+
+![Watchlist](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/watchlist_page_check_1771595624743.png)
+
+### Ask
+Dual-tab interface: **Freeform Q&A** (type a question, optionally filter by ticker, hit ⌘+Enter) and **Templates** (select template, choose period, run). Answers shown with confidence badge, low-confidence warning, derivation trace accordion, and citation sources. All answers persist in session history.
+
+![Ask](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/ask_main_1771595209430.png)
+
+### Ops Dashboard
+System health cards (API, DB, Redis, Workers) with colored health dots, time-window selector (15m–360m), queue depths, filing pipeline status breakdown, recent events, and a recent failures table. Auto-refresh toggle.
+
+![Ops](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/ops_main_1771595248450.png)
+
+---
+
+## Running the Application
+
+| Service | Command | URL |
+|---|---|---|
+| FastAPI backend | `uvicorn services.api:app --port 8000` (from `gravitic-celestial/`) | http://localhost:8000 |
+| React frontend  | `npm run dev` (from `gravitic-celestial/web-ui/`) | http://localhost:5173 |
+
+---
+
+## Part 2: Workflow Hardening & Gaps Fixed
+
+Following a full workflow audit, 7 gaps were identified and resolved across the backend and UI.
+
+### 1. Q&A and Retrieval Integrity
+- **RAG Fallback**: If the LLM Synthesis node fails or responds with "Insufficient context," the framework now defaults back to raw top-K context excerpts to guarantee some answer.
+- **NaN Safeguard**: `_clamp_confidence()` now catches missing values to prevent NaNs in the confidence scoring metric.
+- **Ticker Validation**: The Ask page features debounced validation to warn users if they ask about a ticker with zero indexed filings.
+
+### 2. Operational Retry Capabilities
+- **Dead-Letter Resumption**: Pipeline failures in the `DEAD_LETTER` state can now be retried linearly or en-masse via the Ops Dashboard. 
+- **Maintenance Actions**: Backfill metadata buttons and auto-refresh countdowns guarantee operators know exactly when the page syncs and how to maintain the pipeline.
+
+**Ops Retry Implementation:**
+![Retry Buttons](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/.system_generated/click_feedback/click_feedback_1771606410085.png)
+
+### 3. Drilldown Filing Detail Panel
+- The dashboard now utilizes an animated slide-in panel showing the specific pipeline status, accession number, and an on-the-fly synthesized 3-bullet summary of the filing.
+
+**Filing Detail Panel:**
+![Panel Drilldown](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/.system_generated/click_feedback/click_feedback_1771606524671.png)
+
+### 4. Data Consistency
+- **Unread Badges:** Fixed the notification count payload mapping so the unread counter functions globally.
+- **Watchlist Additions:** Hardened the API and React client against `created_at` Pydantic validation errors that caused silent component crashes.
+
+---
+
+## Verification Recording
+
+**Full End-to-End Walkthrough of Fixes:**
+![Gap fixes verification](/Users/arjun/.gemini/antigravity/brain/54835637-c538-4eec-80a3-512d8c5c6aa8/verification_of_7_gaps_1771606274754.webp)
