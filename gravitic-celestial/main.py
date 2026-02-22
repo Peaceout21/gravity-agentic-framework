@@ -19,11 +19,12 @@ from core.tools.provider_factory import create_market_provider
 
 
 class FrameworkRuntime(object):
-    def __init__(self, tickers, poll_interval_seconds=300):
+    def __init__(self, tickers, poll_interval_seconds=300, market=None):
         load_dotenv()
 
         sec_identity = os.getenv("SEC_IDENTITY", "Unknown unknown@example.com")
-        default_market = (os.getenv("GRAVITY_MARKET_DEFAULT", "US_SEC") or "US_SEC").strip().upper()
+        default_market = market or (os.getenv("GRAVITY_MARKET_DEFAULT", "US_SEC") or "US_SEC").strip().upper()
+        self.market = default_market
         gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         gemini_model = os.getenv("GEMINI_MODEL")
 
@@ -32,7 +33,7 @@ class FrameworkRuntime(object):
 
         self.event_bus = EventBus()
         self.state_manager = backends["state_manager"]
-        self.edgar_client = create_market_provider(market=default_market, sec_identity=sec_identity)
+        self.edgar_client = create_market_provider(market=self.market, sec_identity=sec_identity)
         self.extraction_engine = ExtractionEngine(adapter=GeminiAdapter(api_key=gemini_api_key, model_name=gemini_model))
         self.synthesis_engine = SynthesisEngine(adapter=GeminiAdapter(api_key=gemini_api_key, model_name=gemini_model))
         self.rag_engine = backends["rag_engine"]
@@ -53,6 +54,7 @@ class FrameworkRuntime(object):
             graph_runtime=self.graph_runtime,
             tickers=tickers,
             poll_interval_seconds=poll_interval_seconds,
+            market=self.market,
         )
         self.analyst_agent = AnalystAgent(event_bus=self.event_bus, graph_runtime=self.graph_runtime)
         self.knowledge_agent = KnowledgeAgent(event_bus=self.event_bus, graph_runtime=self.graph_runtime)
@@ -76,7 +78,7 @@ class FrameworkRuntime(object):
         self.event_bus.stop()
 
     def run_pipeline_once(self):
-        payloads = self.graph_runtime.run_ingestion_cycle(self.ingestion_agent.tickers)
+        payloads = self.graph_runtime.run_ingestion_cycle(self.ingestion_agent.tickers, market=self.market)
         for payload in payloads:
             analysis = self.graph_runtime.analyze_filing(payload)
             if analysis:
@@ -88,18 +90,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Gravity Agentic Framework")
     parser.add_argument("--tickers", default="MSFT,AAPL", help="Comma-separated ticker symbols")
     parser.add_argument("--poll-interval", type=int, default=300, help="Ingestion poll interval in seconds")
+    parser.add_argument("--market", default="US_SEC", choices=["US_SEC", "SEA_LOCAL"], help="Target market for ingestion")
     parser.add_argument("--run-once", action="store_true", help="Run one cycle and exit")
     return parser.parse_args()
 
 
-def build_runtime(tickers, poll_interval_seconds=300):
-    return FrameworkRuntime(tickers=tickers, poll_interval_seconds=poll_interval_seconds)
+def build_runtime(tickers, poll_interval_seconds=300, market="US_SEC"):
+    return FrameworkRuntime(tickers=tickers, poll_interval_seconds=poll_interval_seconds, market=market)
 
 
 def main():
     args = parse_args()
     tickers = [item.strip().upper() for item in args.tickers.split(",") if item.strip()]
-    runtime = build_runtime(tickers=tickers, poll_interval_seconds=args.poll_interval)
+    runtime = build_runtime(tickers=tickers, poll_interval_seconds=args.poll_interval, market=args.market)
 
     if args.run_once:
         payloads = runtime.run_pipeline_once()

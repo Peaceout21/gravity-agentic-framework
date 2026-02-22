@@ -20,7 +20,7 @@ class AnalystNodes(object):
         payload = state.get("filing_payload")
         if payload is None:
             return self._merge(state, {"analysis_dict": {}, "errors": state.get("errors", []) + ["missing_filing_payload"]})
-        extracted = self.extraction_engine.extract(payload.raw_text, reflection=False)
+        extracted = self.extraction_engine.extract(payload.raw_text, reflection=False, market=payload.market)
         return self._merge(
             state,
             {
@@ -44,7 +44,7 @@ class AnalystNodes(object):
 
     def reflection_retry_once(self, state):
         payload = state.get("filing_payload")
-        reflected = self.extraction_engine.extract(payload.raw_text, reflection=True)
+        reflected = self.extraction_engine.extract(payload.raw_text, reflection=True, market=payload.market)
         return self._merge(
             state,
             {

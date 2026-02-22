@@ -195,6 +195,11 @@ class OpsMetricsResponse(BaseModel):
     recent_failures: list
 
 
+class OpsRetryAllResponse(BaseModel):
+    status: str
+    enqueued_count: int
+
+
 class BackfillRequest(BaseModel):
     tickers: List[str]
     market: str = "US_SEC"
@@ -258,7 +263,7 @@ class TemplateRunResponse(BaseModel):
     run_id: int
     template_id: int
     template_title: str
-    rendered_question: str
+    question: str
     relevance_label: str
     relevance_score: float
     coverage_brief: str
@@ -271,12 +276,12 @@ class TemplateRunResponse(BaseModel):
 
 class TemplateRunItem(BaseModel):
     id: int
-    template_id: int
-    template_title: str
+    template_id: Optional[int] = None
+    template_title: Optional[str] = "Freeform Q&A"
     ticker: str
-    rendered_question: str
-    relevance_label: str
-    coverage_brief: str
+    question: str
+    relevance_label: str = ""
+    coverage_brief: str = ""
     answer_markdown: str
     citations: List[str]
     confidence: float = 0.0
@@ -386,6 +391,19 @@ def list_filings(limit: int = 25, auth: AuthContext = Depends(_auth_context)):
     return [FilingItem(**row) for row in filtered[:limit]]
 
 
+@app.get("/filings/{accession_number}", response_model=FilingItem)
+def get_filing(accession_number: str, auth: AuthContext = Depends(_auth_context)):
+    comps = _get_components()
+    filing = comps["state_manager"].get_filing(accession_number)
+    if not filing:
+        raise HTTPException(status_code=404, detail="Filing not found")
+    scoped_tickers = _watchlist_scope(comps["state_manager"], auth, market=filing.get("market"))
+    filing_ticker = str(filing.get("ticker", "")).upper()
+    if filing_ticker and filing_ticker not in scoped_tickers:
+        raise HTTPException(status_code=403, detail="Filing is outside your watchlist scope")
+    return FilingItem(**filing)
+
+
 @app.get("/markets", response_model=MarketsResponse)
 def list_markets():
     comps = _get_components()
@@ -487,12 +505,30 @@ def backfill(req: BackfillRequest, auth: AuthContext = Depends(_auth_context)):
 
 
 @app.post("/query", response_model=QueryResponse)
-def query(req: QueryRequest):
+def query(req: QueryRequest, auth: AuthContext = Depends(_auth_context)):
     comps = _get_components()
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
 
     answer = comps["graph_runtime"].answer_question(req.question.strip(), ticker=req.ticker)
+    
+    # Persist freeform query to history
+    try:
+        sm = comps["state_manager"]
+        sm.log_query(
+            org_id=auth.org_id,
+            user_id=auth.user_id,
+            ticker=req.ticker,
+            question=req.question.strip(),
+            answer_markdown=answer.answer_markdown,
+            citations=answer.citations,
+            confidence=float(getattr(answer, "confidence", 0.0) or 0.0),
+            derivation_trace=list(getattr(answer, "derivation_trace", []) or []),
+            latency_ms=0,
+        )
+    except Exception as exc:
+        logger.error("Failed to log freeform query: %s", exc)
+
     return QueryResponse(
         question=answer.question,
         answer_markdown=answer.answer_markdown,
@@ -563,11 +599,25 @@ def list_template_runs(limit: int = 20, auth: AuthContext = Depends(_auth_contex
     return [TemplateRunItem(**row) for row in rows]
 
 
+@app.get("/ask/history", response_model=List[TemplateRunItem])
+def list_ask_history(limit: int = 40, auth: AuthContext = Depends(_auth_context)):
+    comps = _get_components()
+    rows = comps["state_manager"].list_query_history(org_id=auth.org_id, user_id=auth.user_id, limit=limit)
+    # We reuse TemplateRunItem as it has compatible fields
+    return [TemplateRunItem(**row) for row in rows]
+
+
 @app.get("/watchlist", response_model=List[WatchlistItem])
 def list_watchlist(market: Optional[str] = None, auth: AuthContext = Depends(_auth_context)):
     comps = _get_components()
     rows = comps["state_manager"].list_watchlist(org_id=auth.org_id, user_id=auth.user_id, market=market)
-    return [WatchlistItem(**row) for row in rows]
+    items = []
+    for row in rows:
+        try:
+            items.append(WatchlistItem(**{**row, "created_at": row.get("created_at", "")}))
+        except Exception:
+            pass
+    return items
 
 
 @app.post("/watchlist")
@@ -755,3 +805,26 @@ def replay_filing(req: FilingReplayRequest, auth: AuthContext = Depends(_auth_co
         raise HTTPException(status_code=500, detail="Replay failed: %s" % exc)
 
     return FilingReplayResponse(**result)
+
+
+@app.post("/ops/retry-all-dead-letter", response_model=OpsRetryAllResponse)
+def retry_all_dead_letter(auth: AuthContext = Depends(_auth_context)):
+    _ = auth
+    comps = _get_components()
+    sm = comps["state_manager"]
+    gr = comps["graph_runtime"]
+
+    dead_letters = sm.list_all_dead_letters()
+    if not dead_letters:
+        return OpsRetryAllResponse(status="ok", enqueued_count=0)
+
+    count = 0
+    for filing in dead_letters:
+        try:
+            # We use 'auto' mode for bulk retry to match the existing single-replay logic
+            gr.replay_filing(filing["accession_number"], mode="auto")
+            count += 1
+        except Exception as exc:
+            logger.error("Bulk retry failed for %s: %s", filing["accession_number"], exc)
+
+    return OpsRetryAllResponse(status="ok", enqueued_count=count)

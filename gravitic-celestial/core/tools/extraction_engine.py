@@ -88,18 +88,18 @@ class ExtractionEngine(object):
     def __init__(self, adapter=None):
         self.adapter = adapter or GeminiAdapter()
 
-    def extract(self, raw_text, reflection=False):
-        prompt = self._build_prompt(raw_text, reflection=reflection)
+    def extract(self, raw_text, reflection=False, market="US_SEC"):
+        prompt = self._build_prompt(raw_text, reflection=reflection, market=market)
         data = self.adapter.generate_json(prompt)
         if not isinstance(data, dict):
             return {}
         return self._normalize_metric_aliases(data)
 
-    def extract_with_reflection(self, raw_text):
-        primary = self.extract(raw_text, reflection=False)
+    def extract_with_reflection(self, raw_text, market="US_SEC"):
+        primary = self.extract(raw_text, reflection=False, market=market)
         if self.is_valid(primary):
             return primary
-        return self.extract(raw_text, reflection=True)
+        return self.extract(raw_text, reflection=True, market=market)
 
     def is_valid(self, data):
         if not data:
@@ -168,7 +168,34 @@ class ExtractionEngine(object):
             return False
 
     @staticmethod
-    def _build_prompt(raw_text, reflection=False):
+    def _build_prompt(raw_text, reflection=False, market="US_SEC"):
+        if market == "SEA_LOCAL":
+            if PromptTemplate is not None:
+                template = (
+                    "Extract financial data as JSON with keys: kpis, summary, guidance. "
+                    "Previous extraction failed. Identify the source language and currency, translate to English, and normalize monetary values to USD.\n\nText:\n{text}"
+                    if reflection
+                    else "You are an expert financial analyst. Your task is to process a Southeast Asian financial filing.\n"
+                    "1. Identify original language and currency.\n"
+                    "2. Translate narrative management guidance into English.\n"
+                    "3. Normalize all monetary KPI values to USD.\n"
+                    "Return valid JSON only with keys: kpis, summary, guidance. Each KPI requires metric and value.\n\nText:\n{text}"
+                )
+                return PromptTemplate.from_template(template).format(text=raw_text)
+            if reflection:
+                return (
+                    "Extract financial data as JSON with keys: kpis, summary, guidance. "
+                    "Previous extraction failed. Identify the source language and currency, translate to English, and normalize monetary values to USD.\n\n"
+                    "Text:\n%s" % raw_text
+                )
+            return (
+                "You are an expert financial analyst. Your task is to process a Southeast Asian financial filing.\n"
+                "1. Identify original language and currency.\n"
+                "2. Translate narrative management guidance into English.\n"
+                "3. Normalize all monetary KPI values to USD.\n"
+                "Return valid JSON only with keys: kpis, summary, guidance. Each KPI requires metric and value.\n\nText:\n%s" % raw_text
+            )
+
         if PromptTemplate is not None:
             template = (
                 "Extract financial data as JSON with keys: kpis, summary, guidance. "

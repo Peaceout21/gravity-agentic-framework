@@ -324,6 +324,25 @@ class EdgarClient(object):
             logging.exception("SEC text request failed url=%s", url)
             return ""
 
+    def refine_metadata(self, raw_text, metadata):
+        # type: (str, Dict[str, Any]) -> Dict[str, Any]
+        refined = dict(metadata)
+        
+        # 1. Filing Date fallback (looking for "FILED AS OF DATE: YYYYMMDD" or similar)
+        if not refined.get("filing_date"):
+            date_match = re.search(r"FILED AS OF DATE:\s*(\d{8})", raw_text)
+            if date_match:
+                d = date_match.group(1)
+                refined["filing_date"] = "%s-%s-%s" % (d[:4], d[4:6], d[6:])
+        
+        # 2. Item Codes fallback (8-K items: "Item 2.02", "Item 7.01", etc.)
+        if not refined.get("item_code"):
+            items = sorted(list(set(re.findall(r"Item\s*(\d+\.\d+)", raw_text, re.IGNORECASE))))
+            if items:
+                refined["item_code"] = ",".join(items)
+                
+        return refined
+
 
 def html_to_text(raw_text):
     if not raw_text:

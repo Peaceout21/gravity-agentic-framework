@@ -199,22 +199,21 @@ class StateManager(object):
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS ask_template_runs (
+                CREATE TABLE IF NOT EXISTS query_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     org_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
-                    template_id INTEGER NOT NULL,
                     ticker TEXT,
-                    rendered_question TEXT NOT NULL,
-                    relevance_label TEXT NOT NULL,
-                    coverage_brief TEXT NOT NULL,
+                    question TEXT NOT NULL,
                     answer_markdown TEXT NOT NULL,
                     citations_json TEXT NOT NULL,
                     confidence REAL NOT NULL DEFAULT 0,
                     derivation_trace_json TEXT NOT NULL DEFAULT '[]',
+                    relevance_label TEXT,
+                    coverage_brief TEXT,
+                    template_id INTEGER,
                     latency_ms INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY(template_id) REFERENCES ask_templates(id) ON DELETE CASCADE
+                    created_at TEXT NOT NULL
                 )
                 """
             )
@@ -707,6 +706,27 @@ class StateManager(object):
             }
             for row in rows
         ]
+    def list_all_dead_letters(self):
+        # type: () -> List[Dict[str, Any]]
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT accession_number, ticker, filing_url, status, updated_at
+                FROM filings
+                WHERE status = 'DEAD_LETTER'
+                """
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "accession_number": row[0],
+                "ticker": row[1],
+                "filing_url": row[2],
+                "status": row[3],
+                "updated_at": row[4],
+            }
+            for row in rows
+        ]
 
     def list_recent_analyzed_filings(self, ticker=None, limit=8):
         # type: (Optional[str], int) -> List[Dict[str, Any]]
@@ -828,6 +848,52 @@ class StateManager(object):
             rows = cur.fetchall()
         return [{"filing_type": row[0], "item_code": row[1] or "", "weight": float(row[2])} for row in rows]
 
+    def log_query(
+        self,
+        org_id,
+        user_id,
+        ticker,
+        question,
+        answer_markdown,
+        citations,
+        confidence=0.0,
+        derivation_trace=None,
+        relevance_label=None,
+        coverage_brief=None,
+        template_id=None,
+        latency_ms=0,
+    ):
+        now = datetime.utcnow().isoformat()
+        citations_json = json.dumps(citations or [], ensure_ascii=True)
+        derivation_trace_json = json.dumps(derivation_trace or [], ensure_ascii=True)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO query_history(
+                    org_id, user_id, ticker, question, answer_markdown, citations_json,
+                    confidence, derivation_trace_json, relevance_label, coverage_brief,
+                    template_id, latency_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    org_id,
+                    user_id,
+                    ticker.upper() if ticker else None,
+                    question,
+                    answer_markdown,
+                    citations_json,
+                    float(confidence or 0.0),
+                    derivation_trace_json,
+                    relevance_label,
+                    coverage_brief,
+                    template_id,
+                    int(latency_ms),
+                    now,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
     def create_ask_template_run(
         self,
         org_id,
@@ -843,48 +909,33 @@ class StateManager(object):
         derivation_trace=None,
         latency_ms=0,
     ):
-        # type: (...) -> int
-        now = datetime.utcnow().isoformat()
-        citations_json = json.dumps(citations or [], ensure_ascii=True)
-        derivation_trace_json = json.dumps(derivation_trace or [], ensure_ascii=True)
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO ask_template_runs(
-                    org_id, user_id, template_id, ticker, rendered_question, relevance_label,
-                    coverage_brief, answer_markdown, citations_json, confidence, derivation_trace_json, latency_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    org_id,
-                    user_id,
-                    template_id,
-                    ticker.upper() if ticker else None,
-                    rendered_question,
-                    relevance_label,
-                    coverage_brief,
-                    answer_markdown,
-                    citations_json,
-                    float(confidence or 0.0),
-                    derivation_trace_json,
-                    int(latency_ms),
-                    now,
-                ),
-            )
-            conn.commit()
-            return int(cur.lastrowid)
+        return self.log_query(
+            org_id=org_id,
+            user_id=user_id,
+            ticker=ticker,
+            question=rendered_question,
+            answer_markdown=answer_markdown,
+            citations=citations,
+            confidence=confidence,
+            derivation_trace=derivation_trace,
+            relevance_label=relevance_label,
+            coverage_brief=coverage_brief,
+            template_id=template_id,
+            latency_ms=latency_ms,
+        )
 
-    def list_ask_template_runs(self, org_id, user_id, limit=20):
+    def list_query_history(self, org_id, user_id, limit=20):
         # type: (str, str, int) -> List[Dict[str, Any]]
         with self._connect() as conn:
             cur = conn.execute(
                 """
-                SELECT r.id, r.template_id, t.title, r.ticker, r.rendered_question, r.relevance_label,
-                       r.coverage_brief, r.answer_markdown, r.citations_json, r.confidence, r.derivation_trace_json, r.latency_ms, r.created_at
-                FROM ask_template_runs r
-                JOIN ask_templates t ON t.id = r.template_id
-                WHERE r.org_id = ? AND r.user_id = ?
-                ORDER BY r.created_at DESC
+                SELECT h.id, h.template_id, t.title, h.ticker, h.question, h.relevance_label,
+                       h.coverage_brief, h.answer_markdown, h.citations_json, h.confidence,
+                       h.derivation_trace_json, h.latency_ms, h.created_at
+                FROM query_history h
+                LEFT JOIN ask_templates t ON t.id = h.template_id
+                WHERE h.org_id = ? AND h.user_id = ?
+                ORDER BY h.created_at DESC
                 LIMIT ?
                 """,
                 (org_id, user_id, limit),
@@ -904,11 +955,11 @@ class StateManager(object):
                 {
                     "id": row[0],
                     "template_id": row[1],
-                    "template_title": row[2],
+                    "template_title": row[2] or "Freeform Q&A",
                     "ticker": row[3] or "",
-                    "rendered_question": row[4],
-                    "relevance_label": row[5],
-                    "coverage_brief": row[6],
+                    "question": row[4],
+                    "relevance_label": row[5] or "",
+                    "coverage_brief": row[6] or "",
                     "answer_markdown": row[7],
                     "citations": citations,
                     "confidence": float(row[9] or 0.0),
@@ -918,6 +969,9 @@ class StateManager(object):
                 }
             )
         return results
+
+    def list_ask_template_runs(self, org_id, user_id, limit=20):
+        return self.list_query_history(org_id, user_id, limit)
 
     def count_filings_for_ticker(self, ticker):
         # type: (str) -> int

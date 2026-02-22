@@ -127,6 +127,11 @@ class IngestionNodes(object):
         if not current:
             return self._merge(state, {"trace": state.get("trace", []) + ["emit_payload_skipped"]})
 
+        # Refine metadata using raw text if available
+        refined_meta = current.get("metadata", {})
+        if hasattr(self.edgar_client, "refine_metadata") and current.get("raw_text"):
+            refined_meta = self.edgar_client.refine_metadata(current["raw_text"], refined_meta)
+        
         payload = FilingPayload(
             market=current.get("market", self.market),
             exchange=current.get("exchange", self.exchange),
@@ -137,7 +142,7 @@ class IngestionNodes(object):
             accession_number=current["accession_number"],
             filing_url=current["filing_url"],
             raw_text=current.get("raw_text", ""),
-            metadata=current.get("metadata", {}),
+            metadata=refined_meta,
         )
         payloads.append(payload)
         metadata = payload.metadata or {}

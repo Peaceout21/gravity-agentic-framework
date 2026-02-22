@@ -27,7 +27,8 @@ class SynthesisNodes(object):
         )
 
     def retrieve_semantic(self, state):
-        semantic = self.rag_engine.semantic_search(state.get("question", ""), top_k=8)
+        ticker = state.get("ticker")
+        semantic = self.rag_engine.semantic_search(state.get("question", ""), top_k=15, ticker=ticker)
         return self._merge(
             state,
             {
@@ -37,7 +38,8 @@ class SynthesisNodes(object):
         )
 
     def retrieve_keyword(self, state):
-        keyword = self.rag_engine.keyword_search(state.get("question", ""), top_k=8)
+        ticker = state.get("ticker")
+        keyword = self.rag_engine.keyword_search(state.get("question", ""), top_k=15, ticker=ticker)
         return self._merge(
             state,
             {
@@ -125,12 +127,28 @@ class SynthesisNodes(object):
         answer = self.synthesis_engine.synthesize(state.get("question", ""), contexts)
         derived_answer = (state.get("derived_answer") or "").strip()
         derivation_trace = state.get("derivation_trace", []) or []
-        confidence = float(state.get("answer_confidence", 0.0) or 0.0)
+        # Use _clamp_confidence to guard against None/NaN before checking threshold
+        confidence = _clamp_confidence(state.get("answer_confidence", 0.0))
 
         if derived_answer:
             answer = "%s\n\n### Derived Metric\n%s" % (answer, derived_answer)
             if derivation_trace:
                 answer = "%s\n\n### Derivation Trace\n- %s" % (answer, "\n- ".join(derivation_trace))
+
+        # If the LLM returned a non-answer, fall back to a RAG-only summary from top contexts
+        if _looks_like_non_answer(answer or "") and contexts:
+            top_contexts = contexts[:3]
+            rag_lines = []
+            for i, ctx in enumerate(top_contexts, 1):
+                snippet = ctx[:400].replace("\n", " ").strip()
+                if snippet:
+                    rag_lines.append("**[%d]** %s" % (i, snippet))
+            if rag_lines:
+                answer = (
+                    "*Direct synthesis was inconclusive. Here are the most relevant excerpts from indexed filings:*\n\n"
+                    + "\n\n".join(rag_lines)
+                )
+                confidence = _heuristic_confidence(contexts, citations)
 
         if confidence <= 0.0:
             confidence = _heuristic_confidence(contexts, citations)
